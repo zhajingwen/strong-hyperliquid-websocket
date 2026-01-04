@@ -14,6 +14,7 @@
 import time
 import random
 import logging
+import threading
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -97,6 +98,10 @@ class HealthMonitor:
         self.stats = ConnectionStats()
         self._warned = False
 
+        # 线程安全保护
+        self._stats_lock = threading.Lock()
+        self._warned_lock = threading.Lock()
+
     def on_message(self, msg: Any) -> None:
         """
         记录收到消息
@@ -104,21 +109,30 @@ class HealthMonitor:
         Args:
             msg: WebSocket 消息
         """
-        self.stats.last_message_time = time.time()
-        self.stats.total_messages += 1
-        self._warned = False  # 重置警告标志
+        with self._stats_lock:
+            self.stats.last_message_time = time.time()
+            self.stats.total_messages += 1
 
-        if self.stats.total_messages % 100 == 0:
-            logger.debug(f"已处理 {self.stats.total_messages} 条消息")
+        with self._warned_lock:
+            self._warned = False  # 重置警告标志
+
+        # 使用局部变量避免重复加锁
+        with self._stats_lock:
+            total_messages = self.stats.total_messages
+
+        if total_messages % 100 == 0:
+            logger.debug(f"已处理 {total_messages} 条消息")
 
     def on_error(self) -> None:
         """记录错误"""
-        self.stats.total_errors += 1
+        with self._stats_lock:
+            self.stats.total_errors += 1
 
     def on_reconnect(self) -> None:
         """记录重连"""
-        self.stats.total_reconnects += 1
-        self.stats.last_reconnect_time = time.time()
+        with self._stats_lock:
+            self.stats.total_reconnects += 1
+            self.stats.last_reconnect_time = time.time()
 
     def is_alive(self) -> bool:
         """
@@ -131,12 +145,13 @@ class HealthMonitor:
         idle_time = self.stats.get_idle_time()
 
         # 警告阈值检查
-        if idle_time > self.warning_threshold and not self._warned:
-            logger.warning(
-                f"⚠️  数据流异常：{idle_time:.1f}秒无数据 "
-                f"(警告阈值: {self.warning_threshold}秒)"
-            )
-            self._warned = True
+        with self._warned_lock:
+            if idle_time > self.warning_threshold and not self._warned:
+                logger.warning(
+                    f"⚠️  数据流异常：{idle_time:.1f}秒无数据 "
+                    f"(警告阈值: {self.warning_threshold}秒)"
+                )
+                self._warned = True
 
         # 超时检查
         if idle_time > self.timeout:
@@ -314,24 +329,37 @@ class EnhancedWebSocketManager:
         self._running = False
         self._subscription_ids: List[int] = []
 
+        # 线程安全保护
+        self._state_lock = threading.RLock()  # 使用递归锁避免死锁
+
+        # 连接就绪事件
+        self._connection_ready_event = threading.Event()
+        self._connection_timeout = 10.0  # 最大等待时间（秒）
+
     @property
     def state(self) -> ConnectionState:
         """获取连接状态"""
-        return self._state
+        with self._state_lock:
+            return self._state
 
     @state.setter
     def state(self, new_state: ConnectionState) -> None:
         """设置连接状态"""
-        if new_state != self._state:
+        # 在锁内检查并更新状态
+        with self._state_lock:
+            if new_state == self._state:
+                return  # 避免重复触发
+
             old_state = self._state
             self._state = new_state
             logger.info(f"连接状态变化: {old_state.value} → {new_state.value}")
 
-            if self.on_state_change:
-                try:
-                    self.on_state_change(new_state)
-                except Exception as e:
-                    logger.error(f"状态变化回调异常: {e}")
+        # 回调在锁外执行，避免死锁
+        if self.on_state_change:
+            try:
+                self.on_state_change(new_state)
+            except Exception as e:
+                logger.error(f"状态变化回调异常: {e}", exc_info=True)
 
     def _wrapped_callback(self, msg: Any) -> None:
         """
@@ -352,21 +380,45 @@ class EnhancedWebSocketManager:
 
     def _is_connected(self) -> bool:
         """
-        检查底层连接状态
+        检查底层 WebSocket 是否已连接
 
         Returns:
             True: 底层连接正常
             False: 底层连接断开
         """
-        if self._info is None or self._info.ws_manager is None:
-            return False
+        try:
+            # 检查 Info 对象
+            if self._info is None:
+                return False
 
-        ws_manager = self._info.ws_manager
-        return (
-            ws_manager.ws_ready and
-            hasattr(ws_manager.ws, 'keep_running') and
-            ws_manager.ws.keep_running
-        )
+            # 检查 ws_manager
+            if not hasattr(self._info, 'ws_manager') or self._info.ws_manager is None:
+                return False
+
+            ws_manager = self._info.ws_manager
+
+            # 检查 ws_ready 标志
+            if not getattr(ws_manager, 'ws_ready', False):
+                return False
+
+            # 检查 WebSocket 对象
+            if not hasattr(ws_manager, 'ws') or ws_manager.ws is None:
+                return False
+
+            # 检查运行状态
+            ws = ws_manager.ws
+            keep_running = getattr(ws, 'keep_running', False)
+
+            # 额外检查：WebSocket 连接是否已打开
+            # websocket-client 库的连接状态
+            if hasattr(ws, 'sock') and ws.sock is None:
+                return False
+
+            return keep_running
+
+        except Exception as e:
+            logger.debug(f"检查连接状态异常: {e}")
+            return False
 
     def _connect(self) -> bool:
         """
@@ -377,30 +429,58 @@ class EnhancedWebSocketManager:
             False: 连接失败
         """
         try:
+            self.state = ConnectionState.CONNECTING
+            self._connection_ready_event.clear()
+
+            # 创建连接
             logger.info(f"正在连接到 {self.base_url}...")
-
-            # 创建新连接
             self._info = Info(self.base_url)
-            time.sleep(2)  # 等待连接建立
 
-            # 验证连接
-            if not self._is_connected():
-                raise RuntimeError("连接建立失败")
+            # 启动连接状态检查线程
+            def wait_for_ready():
+                start_time = time.time()
+                while time.time() - start_time < self._connection_timeout:
+                    if self._is_connected():
+                        self._connection_ready_event.set()
+                        return
+                    time.sleep(0.1)  # 100ms 轮询间隔
+                logger.warning(f"连接超时（{self._connection_timeout}秒），但继续尝试订阅")
+                self._connection_ready_event.set()  # 超时也放行
 
-            logger.info("✓ 连接建立成功")
+            check_thread = threading.Thread(target=wait_for_ready, daemon=True)
+            check_thread.start()
 
-            # 订阅所有频道
-            self._subscription_ids.clear()
-            for sub in self.subscriptions:
-                try:
-                    sub_id = self._info.subscribe(sub, self._wrapped_callback)
-                    self._subscription_ids.append(sub_id)
-                    logger.info(f"✓ 订阅成功: {sub.get('type')} - {sub.get('coin', 'N/A')}")
-                except Exception as e:
-                    logger.error(f"订阅失败: {sub} - {e}")
-                    raise
+            # 等待连接就绪或超时
+            ready = self._connection_ready_event.wait(timeout=self._connection_timeout)
+            if not ready:
+                logger.warning("等待连接就绪超时")
 
-            logger.info(f"✓ 所有订阅完成，共 {len(self._subscription_ids)} 个频道")
+            # 订阅频道（事务性）
+            logger.info(f"开始订阅 {len(self.subscriptions)} 个频道...")
+            temp_subscription_ids = []  # 临时存储
+            try:
+                for sub in self.subscriptions:
+                    try:
+                        sub_id = self._info.subscribe(sub, self._wrapped_callback)
+                        temp_subscription_ids.append(sub_id)
+                        logger.debug(f"已订阅: {sub} (ID: {sub_id})")
+                    except Exception as sub_error:
+                        logger.error(f"订阅失败: {sub} - {sub_error}")
+                        # 回滚：取消已订阅的频道
+                        for sid in temp_subscription_ids:
+                            try:
+                                self._info.unsubscribe(sid)
+                            except:
+                                pass  # 尽力而为
+                        raise  # 重新抛出异常
+
+                # 所有订阅成功，提交
+                self._subscription_ids = temp_subscription_ids
+                self.state = ConnectionState.CONNECTED
+                logger.info("✅ 连接成功并完成订阅")
+            except Exception as sub_error:
+                logger.error(f"订阅过程失败: {sub_error}")
+                raise
 
             # 重置监控器和重连管理器
             self.health_monitor.reset()
@@ -410,21 +490,38 @@ class EnhancedWebSocketManager:
 
         except Exception as e:
             logger.error(f"连接失败: {e}", exc_info=True)
+            self.state = ConnectionState.DISCONNECTED
             self.health_monitor.on_error()
             return False
 
     def _disconnect(self) -> None:
-        """断开连接"""
-        if self._info and self._info.ws_manager:
-            try:
-                logger.info("正在断开连接...")
-                self._info.disconnect_websocket()
-                logger.info("✓ 连接已断开")
-            except Exception as e:
-                logger.error(f"断开连接时异常: {e}")
+        """断开连接并清理资源"""
+        logger.info("正在断开连接...")
 
-        self._info = None
-        self._subscription_ids.clear()
+        try:
+            # 先取消订阅
+            if self._info and self._subscription_ids:
+                for sub_id in self._subscription_ids:
+                    try:
+                        self._info.unsubscribe(sub_id)
+                        logger.debug(f"已取消订阅: {sub_id}")
+                    except Exception as unsub_error:
+                        logger.warning(f"取消订阅失败 ({sub_id}): {unsub_error}")
+
+            # 再断开连接
+            if self._info and hasattr(self._info, 'ws_manager') and self._info.ws_manager:
+                self._info.disconnect_websocket()
+                logger.info("WebSocket 已断开")
+
+        except Exception as e:
+            logger.error(f"断开连接时异常: {e}", exc_info=True)
+            # 不吞噬异常，但确保清理继续
+
+        finally:
+            # 无论如何都清理状态
+            self._subscription_ids.clear()
+            self._info = None
+            self.state = ConnectionState.DISCONNECTED
 
     def _reconnect(self) -> bool:
         """
@@ -484,24 +581,40 @@ class EnhancedWebSocketManager:
         # 主循环：健康检查
         try:
             while self._running:
-                time.sleep(self.health_check_interval)
+                time.sleep(0.1)  # 降低 CPU 占用
 
-                # 检查 1: 底层连接状态
-                if not self._is_connected():
-                    logger.warning("⚠️  底层连接断开")
-                    if not self._reconnect():
-                        continue  # 重连失败，继续等待
+                # 定时健康检查
+                current_time = time.time()
+                if not hasattr(self, '_last_check_time'):
+                    self._last_check_time = current_time
 
-                # 检查 2: 应用层健康状态（假活检测）
-                if not self.health_monitor.is_alive():
-                    logger.warning("⚠️  假活状态检测")
-                    if not self._reconnect():
-                        continue  # 重连失败，继续等待
+                if current_time - self._last_check_time >= self.health_check_interval:
+                    self._last_check_time = current_time
 
-                # 定期输出健康报告
-                if self.health_monitor.stats.total_messages > 0 and \
-                   self.health_monitor.stats.total_messages % 1000 == 0:
-                    self._print_health_report()
+                    # 统一的连接健康检查
+                    needs_reconnect = False
+                    reconnect_reason = ""
+
+                    # 检查 1: 底层连接状态
+                    if not self._is_connected():
+                        needs_reconnect = True
+                        reconnect_reason = "底层连接已断开"
+                    # 检查 2: 应用层假活检测（仅在底层连接正常时检查）
+                    elif not self.health_monitor.is_alive():
+                        needs_reconnect = True
+                        reconnect_reason = f"假活检测触发（{self.health_monitor.stats.get_idle_time():.1f}秒无数据）"
+
+                    # 执行重连
+                    if needs_reconnect:
+                        logger.warning(f"⚠️  检测到问题: {reconnect_reason}")
+                        if not self._reconnect():
+                            # 重连失败，但继续循环等待下次检查
+                            continue
+
+                    # 定期输出健康报告
+                    if self.health_monitor.stats.total_messages > 0 and \
+                       self.health_monitor.stats.total_messages % 1000 == 0:
+                        self._print_health_report()
 
         except KeyboardInterrupt:
             logger.info("\n收到中断信号，正在停止...")

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(.venv/bin/pip:*)",
+      "Bash(uv --version:*)",
+      "Bash(uv sync:*)",
+      "Bash(timeout 15 .venv/bin/python:*)",
+      "Bash(echo:*)"
+    ]
+  }
+}
