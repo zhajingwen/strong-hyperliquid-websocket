@@ -11,7 +11,7 @@ Hyperliquid WebSocket 订阅测试（增强版）
 - ✅ 优雅关闭
 
 使用方法：
-    python tests/ws_holcv.py [选项]
+    python ws_holcv.py [选项]
 
 选项：
     --verbose    详细日志模式

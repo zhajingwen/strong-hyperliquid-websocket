@@ -28,7 +28,9 @@
 
 ### 主要功能
 
-- **假活检测**: 应用层心跳监控,默认 30 秒超时
+- **假活检测**: 双层检测机制
+  - 底层连接状态检查(检测物理连接断开)
+  - 应用层心跳监控(默认 30 秒无数据超时)
 - **智能重连**: 指数退避算法(1s → 2s → 4s → 8s → ...)+ 随机抖动
 - **连接状态管理**: 完整的状态机与状态回调
 - **健康统计**: 实时统计消息数、重连次数、错误次数等
@@ -178,12 +180,16 @@ bot.run()
 ```
 strong-hyperliquid-websocket/
 ├── README.md                   # 项目说明文档(本文件)
+├── OPTIMIZATION_REPORT.md      # 性能优化报告
 ├── pyproject.toml              # 项目配置文件
+├── uv.lock                     # 依赖锁文件
+├── .python-version             # Python 版本配置
 ├── config.json                 # 账户配置文件
-├── main.py                     # 项目入口
-├── enhanced_ws_manager.py      # 增强的 WebSocket 管理器
-├── ws_holcv.py                 # WebSocket 订阅测试程序
-└── example_utils.py            # 示例工具函数
+├── main.py                     # 简单示例入口
+├── enhanced_ws_manager.py      # 增强的 WebSocket 管理器(核心)
+├── ws_holcv.py                 # WebSocket 订阅测试程序(主程序)
+├── example_utils.py            # 示例工具函数
+└── logs/                       # 日志目录
 ```
 
 ### 核心模块
@@ -191,21 +197,24 @@ strong-hyperliquid-websocket/
 #### EnhancedWebSocketManager
 主管理器,协调所有组件:
 - 处理连接建立与断开
-- 执行健康检查
+- 执行双层健康检查:
+  - 底层连接状态检查(检测 WebSocket 物理断开)
+  - 应用层数据流监控(检测假活状态)
 - 管理自动重连
-- 提供统一的 API 接口
+- 提供统一的 API 接口与状态回调
 
 #### HealthMonitor
 健康监控器:
 - 检测数据流中断(假活状态)
-- 追踪消息统计
+- 追踪消息统计(消息数、错误数、空闲时间)
 - 生成健康状态报告
+- 提供警告阈值与超时阈值
 
 #### ReconnectionManager
 重连管理器:
-- 实现指数退避算法
-- 控制重连次数
-- 管理重连延迟
+- 实现指数退避算法(带随机抖动)
+- 控制重连次数(支持无限重试)
+- 管理重连延迟(可配置最大延迟)
 
 ## ⚙️ 配置说明
 
@@ -409,4 +418,4 @@ MIT License
 ---
 
 **版本**: 1.0.0
-**最后更新**: 2025-12-31
+**最后更新**: 2026-01-06
