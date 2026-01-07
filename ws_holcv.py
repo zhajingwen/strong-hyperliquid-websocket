@@ -63,7 +63,7 @@ SUBSCRIPTIONS = [
 # 健康检查配置
 HEALTH_CHECK_INTERVAL = 5.0  # 每5秒检查一次
 DATA_TIMEOUT = 30.0  # 30秒无数据视为假活
-MAX_RETRIES = 10  # 最大重连次数
+MAX_RETRIES = 0  # 最大重连次数（0表示无限重连）
 
 
 # ==================== 回调函数 ====================
