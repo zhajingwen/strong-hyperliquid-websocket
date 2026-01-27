@@ -1,6 +1,6 @@
 """
 增强的 WebSocket 连接管理器
-解决 Hyperliquid SDK 的假活状态问题
+基于原生 websocket-client 的 WebSocket 连接管理
 
 特性：
 - ✅ 双层假活检测（底层连接状态 + 应用层心跳监控）
@@ -11,18 +11,17 @@
 - ✅ 结构化日志与统计
 """
 
+import json
 import time
 import random
 import logging
 import threading
-import concurrent.futures
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 
-from hyperliquid.info import Info
-from hyperliquid.utils.types import Subscription
+import websocket  # websocket-client
 
 
 # 配置日志
@@ -285,7 +284,7 @@ class EnhancedWebSocketManager:
     """
     增强的 WebSocket 连接管理器
 
-    封装 Hyperliquid SDK 的 WebSocket 连接，提供：
+    基于原生 websocket-client 的 WebSocket 连接管理，提供：
     - 自动健康检查
     - 自动重连
     - 连接状态管理
@@ -295,12 +294,11 @@ class EnhancedWebSocketManager:
     def __init__(
         self,
         base_url: str,
-        subscriptions: List[Subscription],
+        subscriptions: List[Dict[str, Any]],
         message_callback: Callable[[Any], None],
         health_check_interval: float = 5.0,
         data_timeout: float = 30.0,
         max_retries: int = 10,
-        subscription_timeout: float = 15.0,
         on_state_change: Optional[Callable[[ConnectionState], None]] = None
     ):
         """
@@ -313,7 +311,6 @@ class EnhancedWebSocketManager:
             health_check_interval: 健康检查间隔（秒）
             data_timeout: 数据流超时时间（秒）
             max_retries: 最大重连次数
-            subscription_timeout: 订阅超时时间（秒）
             on_state_change: 连接状态变化回调
         """
         self.base_url = base_url
@@ -328,17 +325,28 @@ class EnhancedWebSocketManager:
 
         # 连接状态
         self._state = ConnectionState.DISCONNECTED
-        self._info: Optional[Info] = None
         self._running = False
-        self._subscription_ids: List[int] = []
 
         # 线程安全保护
         self._state_lock = threading.RLock()  # 使用递归锁避免死锁
 
-        # 连接就绪事件
-        self._connection_ready_event = threading.Event()
-        self._connection_timeout = 10.0  # 最大等待时间（秒）
-        self._subscription_timeout = subscription_timeout  # 订阅超时时间
+        # WebSocket 连接
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ping_thread: Optional[threading.Thread] = None
+
+        # 连接控制
+        # 将 http(s)://... 转换为 ws(s)://...
+        if base_url.startswith("https"):
+            self._ws_url = "wss" + base_url[len("https"):] + "/ws"
+        else:
+            self._ws_url = "ws" + base_url[len("http"):] + "/ws"
+        self._ws_ready = threading.Event()       # WebSocket 连接就绪信号
+        self._ws_stop_event = threading.Event()  # 停止信号
+        self._connection_timeout = 10.0          # 最大等待时间（秒）
+
+        # 订阅管理
+        self._active_subscriptions: List[Dict[str, Any]] = []
 
     @property
     def state(self) -> ConnectionState:
@@ -365,6 +373,100 @@ class EnhancedWebSocketManager:
             except Exception as e:
                 logger.error(f"状态变化回调异常: {e}", exc_info=True)
 
+    # ==================== WebSocket 回调方法 ====================
+
+    def _on_ws_open(self, ws) -> None:
+        """WebSocket 连接建立回调"""
+        logger.info("WebSocket 连接已建立")
+        self._ws_ready.set()
+
+    def _on_ws_message(self, ws, message: str) -> None:
+        """
+        WebSocket 消息回调
+
+        解析 JSON 消息，过滤内部协议消息（pong、subscriptionResponse），
+        将业务数据传递给用户回调。
+        """
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            logger.warning(f"无法解析 WebSocket 消息: {message[:200]}")
+            return
+
+        # 过滤内部协议消息
+        if isinstance(data, dict):
+            method = data.get("method")
+            if method == "pong":
+                return
+            channel = data.get("channel")
+            if channel == "subscriptionResponse":
+                logger.debug(f"订阅响应: {data}")
+                return
+
+        # 业务数据传递给用户回调
+        self._wrapped_callback(data)
+
+    def _on_ws_error(self, ws, error) -> None:
+        """WebSocket 错误回调"""
+        logger.error(f"WebSocket 错误: {error}")
+        self.health_monitor.on_error()
+
+    def _on_ws_close(self, ws, close_status_code, close_msg) -> None:
+        """WebSocket 连接关闭回调"""
+        logger.info(f"WebSocket 连接已关闭 (code={close_status_code}, msg={close_msg})")
+        self._ws_ready.clear()
+
+    # ==================== 辅助方法 ====================
+
+    def _send_ping(self) -> None:
+        """定时发送 ping 保活（每 10 秒）"""
+        while not self._ws_stop_event.is_set():
+            self._ws_stop_event.wait(timeout=10.0)
+            if self._ws_stop_event.is_set():
+                break
+            try:
+                if self._ws and self._ws_ready.is_set():
+                    self._ws.send(json.dumps({"method": "ping"}))
+            except Exception as e:
+                logger.debug(f"Ping 发送失败: {e}")
+
+    def _cleanup_ws(self) -> None:
+        """清理 WebSocket 连接资源"""
+        # 设置停止信号
+        self._ws_stop_event.set()
+
+        # 关闭 WebSocket
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception as e:
+                logger.debug(f"关闭 WebSocket 异常: {e}")
+
+        # 等待线程结束（5 秒超时）
+        if self._ping_thread and self._ping_thread.is_alive():
+            self._ping_thread.join(timeout=5.0)
+        if self._ws_thread and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=5.0)
+
+        # 清理引用
+        self._ws = None
+        self._ws_thread = None
+        self._ping_thread = None
+        self._ws_ready.clear()
+
+    def _send_subscription(self, subscription: Dict[str, Any], method: str = "subscribe") -> None:
+        """
+        发送订阅/取消订阅消息
+
+        Args:
+            subscription: 订阅配置字典
+            method: "subscribe" 或 "unsubscribe"
+        """
+        msg = {"method": method, "subscription": subscription}
+        self._ws.send(json.dumps(msg))
+
+    # ==================== 核心方法 ====================
+
     def _wrapped_callback(self, msg: Any) -> None:
         """
         包装的消息回调
@@ -382,54 +484,6 @@ class EnhancedWebSocketManager:
             logger.error(f"用户回调异常: {e}", exc_info=True)
             self.health_monitor.on_error()
 
-    def _subscribe_with_retry(
-        self, 
-        subscription: Subscription, 
-        max_retries: int = 3,
-        retry_delay: float = 2.0
-    ) -> int:
-        """
-        带重试机制的订阅方法
-
-        Args:
-            subscription: 订阅对象
-            max_retries: 最大重试次数
-            retry_delay: 重试延迟（秒）
-
-        Returns:
-            订阅ID
-
-        Raises:
-            Exception: 订阅失败
-        """
-        last_error = None
-        
-        for attempt in range(max_retries):
-            try:
-                # 使用线程池实现订阅超时
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._info.subscribe, subscription, self._wrapped_callback)
-                    try:
-                        sub_id = future.result(timeout=self._subscription_timeout)
-                        if attempt > 0:
-                            logger.info(f"订阅成功（第 {attempt + 1} 次尝试）: {subscription}")
-                        return sub_id
-                    except concurrent.futures.TimeoutError:
-                        last_error = TimeoutError(f"订阅超时（{self._subscription_timeout}秒）")
-                        logger.warning(f"订阅超时（尝试 {attempt + 1}/{max_retries}）: {subscription}")
-            except Exception as e:
-                last_error = e
-                logger.warning(f"订阅失败（尝试 {attempt + 1}/{max_retries}）: {subscription} - {e}")
-            
-            # 如果不是最后一次尝试，等待后重试
-            if attempt < max_retries - 1:
-                logger.info(f"等待 {retry_delay} 秒后重试...")
-                time.sleep(retry_delay)
-        
-        # 所有重试都失败
-        logger.error(f"订阅失败（已重试 {max_retries} 次）: {subscription}")
-        raise last_error if last_error else Exception(f"订阅失败: {subscription}")
-
     def _is_connected(self) -> bool:
         """
         检查底层 WebSocket 是否已连接
@@ -439,65 +493,33 @@ class EnhancedWebSocketManager:
             False: 底层连接断开
         """
         try:
-            # 检查 1: Info 对象
-            if self._info is None:
-                logger.debug("连接检查失败: Info对象为None")
-                return False
-
-            # 检查 2: ws_manager
-            if not hasattr(self._info, 'ws_manager'):
-                logger.debug("连接检查失败: Info对象没有ws_manager属性")
-                return False
-            
-            if self._info.ws_manager is None:
-                logger.debug("连接检查失败: ws_manager为None")
-                return False
-
-            ws_manager = self._info.ws_manager
-
-            # 检查 3: ws_ready 标志
-            ws_ready = getattr(ws_manager, 'ws_ready', False)
-            if not ws_ready:
-                logger.debug("连接检查失败: ws_ready标志为False")
-                return False
-
-            # 检查 4: WebSocket 对象
-            if not hasattr(ws_manager, 'ws'):
-                logger.debug("连接检查失败: ws_manager没有ws属性")
-                return False
-                
-            if ws_manager.ws is None:
+            # 检查 1: WebSocketApp 对象
+            if self._ws is None:
                 logger.debug("连接检查失败: WebSocket对象为None")
                 return False
 
-            ws = ws_manager.ws
-
-            # 检查 5: keep_running 标志
-            keep_running = getattr(ws, 'keep_running', False)
-            if not keep_running:
-                logger.debug("连接检查失败: keep_running标志为False")
+            # 检查 2: 就绪信号
+            if not self._ws_ready.is_set():
+                logger.debug("连接检查失败: ws_ready未设置")
                 return False
 
-            # 检查 6: Socket 对象（底层连接）
+            # 检查 3: WebSocket 线程存活
+            if self._ws_thread is None or not self._ws_thread.is_alive():
+                logger.debug("连接检查失败: WebSocket线程已停止")
+                return False
+
+            # 检查 4: 底层 socket 状态
+            ws = self._ws
             if hasattr(ws, 'sock'):
                 if ws.sock is None:
                     logger.debug("连接检查失败: 底层socket为None")
                     return False
-                # 检查socket是否关闭
                 try:
                     if hasattr(ws.sock, 'fileno'):
-                        ws.sock.fileno()  # 如果socket已关闭会抛出异常
+                        ws.sock.fileno()
                 except Exception as sock_error:
                     logger.debug(f"连接检查失败: socket已关闭 - {sock_error}")
                     return False
-
-            # 检查 7: WebSocket线程是否还在运行
-            if hasattr(ws_manager, 'thread'):
-                thread = ws_manager.thread
-                if thread and hasattr(thread, 'is_alive'):
-                    if not thread.is_alive():
-                        logger.debug("连接检查失败: WebSocket线程已停止")
-                        return False
 
             # 所有检查通过
             logger.debug("连接检查通过: 底层连接正常")
@@ -517,53 +539,67 @@ class EnhancedWebSocketManager:
         """
         try:
             self.state = ConnectionState.CONNECTING
-            self._connection_ready_event.clear()
 
-            # 创建连接
-            logger.info(f"正在连接到 {self.base_url}...")
-            self._info = Info(self.base_url)
+            # 清除事件
+            self._ws_stop_event.clear()
+            self._ws_ready.clear()
 
-            # 启动连接状态检查线程
-            def wait_for_ready():
-                start_time = time.time()
-                while time.time() - start_time < self._connection_timeout:
-                    if self._is_connected():
-                        self._connection_ready_event.set()
-                        return
-                    time.sleep(0.1)  # 100ms 轮询间隔
-                logger.warning(f"连接超时（{self._connection_timeout}秒），但继续尝试订阅")
-                self._connection_ready_event.set()  # 超时也放行
+            # 创建 WebSocketApp
+            logger.info(f"正在连接到 {self._ws_url}...")
+            self._ws = websocket.WebSocketApp(
+                self._ws_url,
+                on_open=self._on_ws_open,
+                on_message=self._on_ws_message,
+                on_error=self._on_ws_error,
+                on_close=self._on_ws_close,
+            )
 
-            check_thread = threading.Thread(target=wait_for_ready, daemon=True)
-            check_thread.start()
+            # daemon 线程启动 run_forever
+            self._ws_thread = threading.Thread(
+                target=self._ws.run_forever,
+                daemon=True,
+            )
+            self._ws_thread.start()
 
-            # 等待连接就绪或超时
-            ready = self._connection_ready_event.wait(timeout=self._connection_timeout)
+            # 等待连接就绪
+            ready = self._ws_ready.wait(timeout=self._connection_timeout)
             if not ready:
-                logger.warning("等待连接就绪超时")
+                logger.warning(f"连接超时（{self._connection_timeout}秒）")
+                self._cleanup_ws()
+                self.state = ConnectionState.DISCONNECTED
+                self.health_monitor.on_error()
+                return False
 
-            # 订阅频道（事务性，带超时保护和重试机制）
+            # 启动 ping 保活线程
+            self._ping_thread = threading.Thread(
+                target=self._send_ping,
+                daemon=True,
+            )
+            self._ping_thread.start()
+
+            # 逐个发送订阅消息
             logger.info(f"开始订阅 {len(self.subscriptions)} 个频道...")
-            temp_subscription_ids = []  # 临时存储
-            try:
-                for sub in self.subscriptions:
-                    try:
-                        # 使用带重试的订阅方法
-                        sub_id = self._subscribe_with_retry(sub, max_retries=3, retry_delay=2.0)
-                        temp_subscription_ids.append(sub_id)
-                        logger.debug(f"已订阅: {sub} (ID: {sub_id})")
-                    except Exception as sub_error:
-                        logger.error(f"订阅彻底失败: {sub} - {sub_error}")
-                        # 不需要回滚，因为_disconnect()会清理所有状态
-                        raise  # 重新抛出异常
+            self._active_subscriptions.clear()
+            for sub in self.subscriptions:
+                try:
+                    self._send_subscription(sub)
+                    self._active_subscriptions.append(sub)
+                    logger.debug(f"已订阅: {sub}")
+                except Exception as sub_error:
+                    logger.error(f"订阅失败: {sub} - {sub_error}")
+                    raise
 
-                # 所有订阅成功，提交
-                self._subscription_ids = temp_subscription_ids
-                self.state = ConnectionState.CONNECTED
-                logger.info("✅ 连接成功并完成订阅")
-            except Exception as sub_error:
-                logger.error(f"订阅过程失败: {sub_error}")
-                raise
+            # 验证连接仍然存活
+            if not self._is_connected():
+                logger.error("订阅完成后连接已断开")
+                self._cleanup_ws()
+                self._active_subscriptions.clear()
+                self.state = ConnectionState.DISCONNECTED
+                self.health_monitor.on_error()
+                return False
+
+            self.state = ConnectionState.CONNECTED
+            logger.info("✅ 连接成功并完成订阅")
 
             # 重置监控器和重连管理器
             self.health_monitor.reset()
@@ -573,6 +609,8 @@ class EnhancedWebSocketManager:
 
         except Exception as e:
             logger.error(f"连接失败: {e}", exc_info=True)
+            self._cleanup_ws()
+            self._active_subscriptions.clear()
             self.state = ConnectionState.DISCONNECTED
             self.health_monitor.on_error()
             return False
@@ -582,24 +620,18 @@ class EnhancedWebSocketManager:
         logger.info("正在断开连接...")
 
         try:
-            # 直接断开WebSocket连接（会自动清理所有订阅）
-            if self._info and hasattr(self._info, 'ws_manager') and self._info.ws_manager:
-                # 记录订阅数量用于日志
-                sub_count = len(self._subscription_ids)
-                if sub_count > 0:
-                    logger.debug(f"断开连接将清理 {sub_count} 个订阅")
-                
-                self._info.disconnect_websocket()
-                logger.info("WebSocket 已断开")
+            sub_count = len(self._active_subscriptions)
+            if sub_count > 0:
+                logger.debug(f"断开连接将清理 {sub_count} 个订阅")
+
+            self._cleanup_ws()
+            logger.info("WebSocket 已断开")
 
         except Exception as e:
             logger.error(f"断开连接时异常: {e}", exc_info=True)
-            # 不吞噬异常，但确保清理继续
 
         finally:
-            # 无论如何都清理状态
-            self._subscription_ids.clear()
-            self._info = None
+            self._active_subscriptions.clear()
             self.state = ConnectionState.DISCONNECTED
 
     def _reconnect(self) -> bool:
@@ -750,5 +782,5 @@ class EnhancedWebSocketManager:
             "state": self.state.value,
             "health_report": self.health_monitor.get_health_report(),
             "reconnection_stats": self.reconnection_manager.get_stats(),
-            "subscription_count": len(self._subscription_ids),
+            "subscription_count": len(self._active_subscriptions),
         }
