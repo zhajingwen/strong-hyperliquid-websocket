@@ -68,6 +68,56 @@ MAX_RETRIES = 0  # 最大重连次数（0表示无限重连）
 
 # ==================== 回调函数 ====================
 
+def get_display_width(s: str) -> int:
+    """
+    计算字符串的实际显示宽度
+
+    Args:
+        s: 输入字符串
+
+    Returns:
+        显示宽度（考虑宽字符）
+    """
+    width = 0
+    for char in s:
+        code = ord(char)
+        # ASCII字符：1个宽度
+        if code < 0x80:
+            width += 1
+        # 中文字符（\u4e00-\u9fff）：2个宽度
+        elif 0x4e00 <= code <= 0x9fff:
+            width += 2
+        # Emoji字符（\u1f000-\u1ffff等）：2个宽度
+        elif (0x1f000 <= code <= 0x1ffff or
+              0x2600 <= code <= 0x26ff or
+              0x2700 <= code <= 0x27bf or
+              0xfe00 <= code <= 0xfe0f or
+              0x1f900 <= code <= 0x1f9ff):
+            width += 2
+        # 其他字符：1个宽度
+        else:
+            width += 1
+    return width
+
+
+def pad_string(s: str, width: int) -> str:
+    """
+    智能填充字符串到指定显示宽度
+
+    Args:
+        s: 输入字符串
+        width: 目标显示宽度
+
+    Returns:
+        填充后的字符串
+    """
+    current_width = get_display_width(s)
+    if current_width >= width:
+        return s
+    # 填充空格到目标宽度
+    return s + ' ' * (width - current_width)
+
+
 def safe_print(msg: Any) -> None:
     """
     安全的消息打印函数
@@ -219,7 +269,20 @@ def safe_print(msg: Any) -> None:
 
             # 打印深度表格（最优价在顶部，买单在左，卖单在右）
             print("\n" + "─" * 140)
-            print(f"{'档位':<6} {'':10} {'买单价格 ($)':<16} {'买单数量':<16} {'订单数*':<10} | {'':10} {'卖单价格 ($)':<16} {'卖单数量':<16} {'订单数*':<10}")
+            # 表头
+            header_parts = [
+                pad_string("档位", 6),
+                pad_string("", 10),
+                pad_string("买单价格 ($)", 16),
+                pad_string("买单数量", 16),
+                pad_string("订单数*", 10),
+                "|",
+                pad_string("", 10),
+                pad_string("卖单价格 ($)", 16),
+                pad_string("卖单数量", 16),
+                pad_string("订单数*", 10)
+            ]
+            print(" ".join(header_parts))
             print("─" * 140)
 
             max_depth = max(len(asks), len(bids))
@@ -237,10 +300,24 @@ def safe_print(msg: Any) -> None:
                     # 如果有多个订单聚合，添加高亮标记
                     bid_n_str = f"{bid_n} ⭐" if bid_n > 1 else str(bid_n)
                     # 第1档标注为最优价
-                    bid_label = "🟢" if i == 0 else "🟢"
-                    bid_str = f"{bid_label:<10} ${bid_px:<14.6f} {bid_sz:<16,.1f} {bid_n_str:<10}"
+                    bid_label = "🟢"
+
+                    # 使用显示宽度感知的对齐
+                    bid_parts = [
+                        pad_string(bid_label, 10),
+                        pad_string(f"${bid_px:.6f}", 16),
+                        pad_string(f"{bid_sz:,.1f}", 16),
+                        pad_string(bid_n_str, 10)
+                    ]
+                    bid_str = " ".join(bid_parts)
                 else:
-                    bid_str = f"{'':10} {'-':<14} {'-':<16} {'-':<10}"
+                    bid_parts = [
+                        pad_string("", 10),
+                        pad_string("-", 16),
+                        pad_string("-", 16),
+                        pad_string("-", 10)
+                    ]
+                    bid_str = " ".join(bid_parts)
 
                 # 卖单（正序显示，最优价=最低卖价在顶部）- 放在右边
                 if i < len(asks):
@@ -251,12 +328,33 @@ def safe_print(msg: Any) -> None:
                     # 如果有多个订单聚合，添加高亮标记
                     ask_n_str = f"{ask_n} ⭐" if ask_n > 1 else str(ask_n)
                     # 第1档标注为最优价
-                    ask_label = "🔴" if i == 0 else "🔴"
-                    ask_str = f"{ask_label:<10} ${ask_px:<14.6f} {ask_sz:<16,.1f} {ask_n_str:<10}"
-                else:
-                    ask_str = f"{'':10} {'-':<14} {'-':<16} {'-':<10}"
+                    ask_label = "🔴"
 
-                print(f"{level:<6} {bid_str} | {ask_str}")
+                    # 使用显示宽度感知的对齐
+                    ask_parts = [
+                        pad_string(ask_label, 10),
+                        pad_string(f"${ask_px:.6f}", 16),
+                        pad_string(f"{ask_sz:,.1f}", 16),
+                        pad_string(ask_n_str, 10)
+                    ]
+                    ask_str = " ".join(ask_parts)
+                else:
+                    ask_parts = [
+                        pad_string("", 10),
+                        pad_string("-", 16),
+                        pad_string("-", 16),
+                        pad_string("-", 10)
+                    ]
+                    ask_str = " ".join(ask_parts)
+
+                # 组合完整行
+                row_parts = [
+                    pad_string(str(level), 6),
+                    bid_str,
+                    "|",
+                    ask_str
+                ]
+                print(" ".join(row_parts))
 
             # 打印深度统计
             print("─" * 140)
