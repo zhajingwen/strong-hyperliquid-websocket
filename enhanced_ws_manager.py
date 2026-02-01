@@ -16,6 +16,8 @@ import time
 import random
 import logging
 import threading
+import socket
+import struct
 from typing import Callable, Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -431,28 +433,65 @@ class EnhancedWebSocketManager:
                 logger.debug(f"Ping 发送失败: {e}")
 
     def _cleanup_ws(self) -> None:
-        """清理 WebSocket 连接资源"""
+        """三层清理策略：应用层 + TCP层 + 线程清理"""
         # 设置停止信号
         self._ws_stop_event.set()
 
-        # 关闭 WebSocket
+        # 第一层：应用层礼貌性清理（尽力而为）
+        if self._ws and self._ws_ready.is_set() and len(self._active_subscriptions) > 0:
+            logger.debug("第1层：尝试应用层取消订阅...")
+            for sub in self._active_subscriptions:
+                try:
+                    self._send_subscription(sub, method="unsubscribe")
+                except Exception as e:
+                    logger.debug(f"取消订阅失败（将由TCP层兜底）: {e}")
+                    pass  # 失败不影响后续清理
+            try:
+                time.sleep(0.1)  # 给服务器处理时间
+            except:
+                pass
+
+        # 第二层：TCP层强制关闭（核心！模拟进程重启）
         if self._ws:
+            logger.debug("第2层：TCP层强制断开...")
+            try:
+                if hasattr(self._ws, 'sock') and self._ws.sock:
+                    # SO_LINGER = {1, 0} 发送 RST 立即终止连接
+                    self._ws.sock.setsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_LINGER,
+                        struct.pack('ii', 1, 0)
+                    )
+                    self._ws.sock.shutdown(socket.SHUT_RDWR)  # 双向关闭
+                    self._ws.sock.close()
+                    logger.debug("✓ TCP RST 已发送，服务器将立即清理")
+            except Exception as e:
+                logger.debug(f"TCP关闭失败（已忽略）: {e}")
+
+            # 再调用 websocket-client 的 close（清理状态）
             try:
                 self._ws.close()
             except Exception as e:
-                logger.debug(f"关闭 WebSocket 异常: {e}")
+                logger.debug(f"关闭 WebSocket 异常（已忽略）: {e}")
 
-        # 等待线程结束（5 秒超时）
+        # 第三层：线程清理（确保资源释放）
+        logger.debug("第3层：清理线程资源...")
         if self._ping_thread and self._ping_thread.is_alive():
-            self._ping_thread.join(timeout=5.0)
+            self._ping_thread.join(timeout=2.0)
         if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=5.0)
+            self._ws_thread.join(timeout=2.0)
 
         # 清理引用
         self._ws = None
         self._ws_thread = None
         self._ping_thread = None
         self._ws_ready.clear()
+
+        logger.info("✓ 连接已彻底清理（三层防御）")
+        logger.debug(
+            f"清理验证 - WebSocket: {self._ws is None}, "
+            f"就绪标志: {not self._ws_ready.is_set()}"
+        )
 
     def _send_subscription(self, subscription: Dict[str, Any], method: str = "subscribe") -> None:
         """
@@ -577,6 +616,16 @@ class EnhancedWebSocketManager:
             )
             self._ping_thread.start()
 
+            # 保底措施：先清理可能存在的旧订阅（防止TCP RST失败的情况）
+            logger.debug("保底清理：尝试取消可能存在的旧订阅...")
+            for sub in self.subscriptions:
+                try:
+                    self._send_subscription(sub, method="unsubscribe")
+                except Exception as e:
+                    logger.debug(f"清理旧订阅失败（正常现象）: {e}")
+                    pass  # 如果订阅本来就不存在，会失败，这是正常的
+            time.sleep(0.2)  # 给服务器处理时间
+
             # 逐个发送订阅消息
             logger.info(f"开始订阅 {len(self.subscriptions)} 个频道...")
             self._active_subscriptions.clear()
@@ -616,7 +665,7 @@ class EnhancedWebSocketManager:
             return False
 
     def _disconnect(self) -> None:
-        """断开连接并清理资源"""
+        """断开连接并清理资源（使用三层清理策略）"""
         logger.info("正在断开连接...")
 
         try:
@@ -624,6 +673,7 @@ class EnhancedWebSocketManager:
             if sub_count > 0:
                 logger.debug(f"断开连接将清理 {sub_count} 个订阅")
 
+            # 使用三层清理策略（已包含应用层unsubscribe + TCP RST）
             self._cleanup_ws()
             logger.info("WebSocket 已断开")
 

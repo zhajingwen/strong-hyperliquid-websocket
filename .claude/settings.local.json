@@ -9,7 +9,13 @@
       "Bash(uv --version:*)",
       "Bash(uv sync:*)",
       "Bash(timeout 15 .venv/bin/python:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(timeout 60 python:*)",
+      "Bash(tee:*)",
+      "Bash(chmod:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)"
     ]
   }
 }
