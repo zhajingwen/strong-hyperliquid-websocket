@@ -401,6 +401,8 @@ class EnhancedWebSocketManager:
             if method == "pong":
                 return
             channel = data.get("channel")
+            if channel == "pong":  # 过滤 pong 频道消息
+                return
             if channel == "subscriptionResponse":
                 logger.debug(f"订阅响应: {data}")
                 return
