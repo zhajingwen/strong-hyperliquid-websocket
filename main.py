@@ -34,16 +34,16 @@ from enhanced_ws_manager import (
 
 # API 端点
 BASE_URL = constants.MAINNET_API_URL
-
+tids = []
 # 订阅列表
 SUBSCRIPTIONS = [
     # 高频数据（用于假活检测）
     # {"type": "allMids"},  # 全市场中间价，高频更新
 
     # 市场数据
-    # {"type": "l2Book", "coin": "PURR"},
+    {"type": "l2Book", "coin": "PURR"},
     {"type": "trades", "coin": "PURR"},
-    {"type": "candle", "coin": "PURR", "interval": "5m"},
+    # {"type": "candle", "coin": "PURR", "interval": "5m"},
     # {"type": "bbo", "coin": "ETH"},
 
     # 资产上下文
@@ -144,20 +144,21 @@ def safe_print(msg: Any) -> None:
             if not trades:
                 return
 
-            # 按时间戳降序排序，获取最新的5条交易
+            # 按时间戳降序排序，获取最新的1条交易
             sorted_trades = sorted(trades, key=lambda x: x.get('time', 0), reverse=True)
-            recent_trades = sorted_trades[:5]
+            # recent_trades = sorted_trades[:1]
+            recent_trades = sorted_trades
 
-            # 计算统计数据
-            total_volume = sum(float(t.get('sz', 0)) for t in recent_trades)
-            buy_trades = [t for t in recent_trades if t.get('side') == 'B']
-            sell_trades = [t for t in recent_trades if t.get('side') == 'A']
-            avg_price = sum(float(t.get('px', 0)) for t in recent_trades) / len(recent_trades)
+            # # 计算统计数据
+            # total_volume = sum(float(t.get('sz', 0)) for t in recent_trades)
+            # buy_trades = [t for t in recent_trades if t.get('side') == 'B']
+            # sell_trades = [t for t in recent_trades if t.get('side') == 'A']
+            # avg_price = sum(float(t.get('px', 0)) for t in recent_trades) / len(recent_trades)
 
-            # 打印分隔线和标题
-            print("\n" + "═" * 120)
-            print(f"📊 [{recent_trades[0].get('coin', 'N/A')}] 最新交易详情 (共 {len(trades)} 笔，显示最新 {len(recent_trades)} 笔)")
-            print("═" * 120)
+            # # 打印分隔线和标题
+            # print("\n" + "═" * 120)
+            # print(f"📊 [{recent_trades[0].get('coin', 'N/A')}] 最新交易详情 (共 {len(trades)} 笔，显示最新 {len(recent_trades)} 笔)")
+            # print("═" * 120)
 
             # 打印每笔交易的详细信息
             for idx, trade in enumerate(recent_trades, 1):
@@ -169,13 +170,19 @@ def safe_print(msg: Any) -> None:
 
                 price = float(trade.get('px', 0))
                 size = float(trade.get('sz', 0))
+                tid = trade.get('tid', 'N/A')
+                # 过滤做市商订单
+                if size < 1000:
+                    continue
+                if tid in tids:
+                    continue
+                tids.append(tid)
                 volume = price * size
 
                 timestamp = trade.get('time', 0)
                 time_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
                 tx_hash = trade.get('hash', 'N/A')
-                tid = trade.get('tid', 'N/A')
                 users = trade.get('users', [])
 
                 # 打印分隔线
@@ -215,18 +222,20 @@ def safe_print(msg: Any) -> None:
                         print(f"    🔹 {maker_role}")
                         print(f"       {users[1]}")
 
-            # 打印统计摘要
-            print("\n" + "═" * 120)
-            print(
-                f"📈 统计汇总: "
-                f"买入 {len(buy_trades)} 笔 | "
-                f"卖出 {len(sell_trades)} 笔 | "
-                f"总成交量 {total_volume:.4f} | "
-                f"平均价格 ${avg_price:.8f}"
-            )
-            print("═" * 120 + "\n")
+            # # 打印统计摘要
+            # print("\n" + "═" * 120)
+            # print(
+            #     f"📈 统计汇总: "
+            #     f"买入 {len(buy_trades)} 笔 | "
+            #     f"卖出 {len(sell_trades)} 笔 | "
+            #     f"总成交量 {total_volume:.4f} | "
+            #     f"平均价格 ${avg_price:.8f}"
+            # )
+            # print("═" * 120 + "\n")
 
         elif channel == "l2Book":
+            if msg:
+                return
             # 订单簿 - 详细深度展示
             from datetime import datetime
 

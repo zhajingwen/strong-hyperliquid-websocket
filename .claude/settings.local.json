@@ -15,7 +15,10 @@
       "Bash(tee:*)",
       "Bash(chmod:*)",
       "Bash(python:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(uv run python:*)",
+      "Bash(psql:*)",
+      "Bash(pkill:*)"
     ]
   }
 }
