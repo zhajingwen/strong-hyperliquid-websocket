@@ -1,7 +1,7 @@
 """
 Hyperliquid API 客户端 - 封装 API 调用，处理并发、限流、缓存
 """
-
+import time
 import asyncio
 import logging
 import re
@@ -155,94 +155,60 @@ class HyperliquidAPIClient:
                 logger.debug(f"缓存命中: {cache_key}")
                 return cached
 
-        # 获取完整交易历史（分页）
-        # 修复说明：user_fills_by_time 返回的是 [start_time, end_time] 区间内最旧的 2000 条
-        # 因此需要逐步增大 start_time 来获取完整数据，而不是减小 end_time
-        try:
-            all_fills = []
-            page_size = 2000  # API单次返回限制
+        all_fills = []
+        start_time = 0  # 从最早的时间开始
+        page = 0
 
-            # 第一次调用获取最新记录 - 应用速率限制
+        print(f"→ 开始获取用户成交记录...")
+
+        while True:
             async with self.rate_limiter:
                 async with self.semaphore:
-                    fills = self.info.user_fills(address)
+                    fills = self.info.user_fills_by_time(
+                        address,
+                        start_time=start_time,
+                        aggregate_by_time=True
+                    )
 
+            # 解析响应数据
+            if not isinstance(fills, list):
+                fills = []
+
+            # 没有更多数据，退出循环
             if not fills:
-                logger.info(f"地址无交易记录: {address[:10]}...")
-                return []
+                print(f"✓ 已获取所有数据，共 {len(all_fills)} 条记录")
+                break
 
-            latest_fills = fills
-            all_fills.extend(latest_fills)
-            latest_count = len(latest_fills)
+            all_fills.extend(fills)
+            page += 1
+            print(f"  第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
 
-            logger.info(f"获取交易记录第1页（最新）: {address[:10]}... ({latest_count} 条)")
+            # 如果返回的数据少于2000条，说明已经是最后一页
+            if len(fills) < 2000:
+                print(f"✓ 已到达最后一页，共获取 {len(all_fills)} 条记录")
+                break
 
-            # 如果返回的记录数达到限制，说明可能还有更多历史记录
-            if latest_count >= page_size:
-                # 获取最新批次的最早时间，作为向前分页的目标
-                latest_min_time = min(fill.get('time', 0) for fill in latest_fills)
-                target_end_time = latest_min_time - 1  # 到最新批次的前一毫秒
+            # 使用最后一条记录（最新的）的时间戳+1作为下一次的 startTime
+            last_fill_time = fills[-1].get("time")
+            if last_fill_time is None:
+                print(f"⚠️  无法获取最后一条记录的时间戳，停止翻页")
+                break
 
-                # 从 start_time=0 开始，逐步向新推进，直到接近 target_end_time
-                current_start_time = 0
-                page_num = 2
-                historical_fills = []  # 存储历史数据
+            # 加1毫秒作为下一页的起始时间，避免重复获取同一条记录
+            start_time = last_fill_time + 1
 
-                while current_start_time <= target_end_time:
-                    # 获取更早的记录 - 应用速率限制
-                    async with self.rate_limiter:
-                        async with self.semaphore:
-                            older_fills = self.info.user_fills_by_time(
-                                address,
-                                start_time=current_start_time,
-                                end_time=target_end_time
-                            )
+            # 避免API限流，每页之间延迟500ms
+            time.sleep(0.5)
 
-                    if not older_fills:
-                        logger.info(f"第{page_num}页: 无更多历史数据")
-                        break
+        # 更新缓存
+        if use_cache and all_fills:
+            await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
 
-                    # 这批数据的时间范围
-                    batch_max_time = max(fill.get('time', 0) for fill in older_fills)
+        return all_fills
 
-                    historical_fills.extend(older_fills)
-                    logger.info(f"获取交易记录第{page_num}页（历史）: {address[:10]}... (+{len(older_fills)} 条)")
-
-                    # 如果这批数据少于 2000，说明已经获取完了
-                    if len(older_fills) < page_size:
-                        logger.info(f"第{page_num}页: 已获取完整区间数据（< {page_size} 条）")
-                        break
-
-                    # 更新 start_time 为这批数据的最新时间+1，继续向新推进
-                    current_start_time = batch_max_time + 1
-
-                    # 检查是否已经接近目标时间
-                    if current_start_time > target_end_time:
-                        logger.info(f"第{page_num}页: 已到达目标时间")
-                        break
-
-                    page_num += 1
-
-                    # 避免无限循环（最多获取100页）
-                    if page_num > 100:
-                        logger.warning(f"达到最大分页限制(100页): {address[:10]}...")
-                        break
-
-                # 合并数据：历史数据（旧→新）+ 最新数据
-                all_fills = historical_fills + latest_fills
-                logger.info(f"合并数据: 历史 {len(historical_fills)} 条 + 最新 {latest_count} 条")
-
-            logger.info(f"获取完整交易记录: {address[:10]}... (总计 {len(all_fills)} 条)")
-
-            # 更新缓存
-            if use_cache and all_fills:
-                await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
-
-            return all_fills
-
-        except Exception as e:
-            logger.error(f"获取 user_fills 失败: {address[:10]}... - {e}")
-            return []
+        # except Exception as e:
+            # logger.error(f"获取 user_fills 失败: {address[:10]}... - {e}")
+            # return []
 
     async def get_user_state(
         self,
