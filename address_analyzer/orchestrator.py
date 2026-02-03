@@ -203,8 +203,7 @@ class Orchestrator:
                     'sharpe_ratio': metrics.sharpe_ratio,
                     'total_pnl': metrics.total_pnl,
                     'account_value': metrics.account_value,
-                    'max_drawdown': metrics.max_drawdown,
-                    'net_deposit': metrics.net_deposit
+                    'max_drawdown': metrics.max_drawdown
                 })
 
             self.renderer.console.print(f"✅ 计算完成 [bold]{len(all_metrics)}[/bold] 个地址的指标\n")

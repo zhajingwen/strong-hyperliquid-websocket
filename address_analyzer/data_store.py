@@ -446,8 +446,8 @@ class DataStore:
         sql = """
         INSERT INTO metrics_cache (
             address, total_trades, win_rate, roi, sharpe_ratio,
-            total_pnl, account_value, max_drawdown, net_deposit, calculated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            total_pnl, account_value, max_drawdown, calculated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
         ON CONFLICT (address) DO UPDATE
         SET total_trades = EXCLUDED.total_trades,
             win_rate = EXCLUDED.win_rate,
@@ -456,7 +456,6 @@ class DataStore:
             total_pnl = EXCLUDED.total_pnl,
             account_value = EXCLUDED.account_value,
             max_drawdown = EXCLUDED.max_drawdown,
-            net_deposit = EXCLUDED.net_deposit,
             calculated_at = NOW()
         """
 
@@ -470,8 +469,7 @@ class DataStore:
                 metrics.get('sharpe_ratio', 0),
                 metrics.get('total_pnl', 0),
                 metrics.get('account_value', 0),
-                metrics.get('max_drawdown', 0),
-                metrics.get('net_deposit', 0)
+                metrics.get('max_drawdown', 0)
             )
 
     async def get_all_metrics(self) -> List[Dict]:

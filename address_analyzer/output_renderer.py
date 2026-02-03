@@ -471,7 +471,6 @@ def test_renderer():
             max_drawdown=20 - i,
             avg_trade_size=5000,
             total_volume=500000 + i * 10000,
-            net_deposit=10000,
             first_trade_time=1704067200000,
             last_trade_time=1704326400000,
             active_days=30 + i
