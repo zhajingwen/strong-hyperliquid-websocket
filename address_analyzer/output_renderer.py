@@ -38,10 +38,10 @@ class OutputRenderer:
             top_n: 显示前N个地址
             save_path: 保存路径（可选）
         """
-        # 按总PNL排序
+        # 按胜率降序排序
         sorted_metrics = sorted(
             metrics_list,
-            key=lambda x: x.total_pnl,
+            key=lambda x: x.win_rate,
             reverse=True
         )[:top_n]
 
@@ -186,10 +186,10 @@ class OutputRenderer:
             metrics_list: 指标列表
             output_path: 输出路径
         """
-        # 按总PNL排序
+        # 按胜率降序排序
         sorted_metrics = sorted(
             metrics_list,
-            key=lambda x: x.total_pnl,
+            key=lambda x: x.win_rate,
             reverse=True
         )
 

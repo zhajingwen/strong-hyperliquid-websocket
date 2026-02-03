@@ -28,7 +28,7 @@ class HyperliquidAPIClient:
         store: DataStore,
         max_concurrent: int = 10,
         rate_limit: float = 50.0,  # 请求/秒（支持小数）
-        cache_ttl_hours: int = 1
+        cache_ttl_hours: int = 24
     ):
         """
         初始化 API 客户端
@@ -37,7 +37,7 @@ class HyperliquidAPIClient:
             store: 数据存储实例
             max_concurrent: 最大并发请求数
             rate_limit: 速率限制（请求/秒，支持小数如0.1）
-            cache_ttl_hours: 缓存过期时间（小时）
+            cache_ttl_hours: 缓存过期时间（小时，默认24小时）
         """
         self.store = store
         self.info = Info(skip_ws=True)  # Hyperliquid SDK Info 客户端
@@ -158,7 +158,7 @@ class HyperliquidAPIClient:
         all_fills = []
         start_time = 0  # 从最早的时间开始
         page = 0
-        addr_short = address[:6] + "..." + address[-4:]  # 缩短地址显示
+        addr_short = address
 
         logger.info(f"[{addr_short}] 开始获取用户成交记录...")
 
