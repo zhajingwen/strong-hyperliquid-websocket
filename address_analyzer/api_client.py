@@ -286,15 +286,22 @@ class HyperliquidAPIClient:
             logger.error(f"获取 user_fills_by_time 失败: {address} - {e}")
             return []
 
-    async def get_user_funding(self, address: str) -> List[Dict]:
+    async def get_user_funding(
+        self,
+        address: str,
+        start_time: int = 0,
+        end_time: Optional[int] = None
+    ) -> List[Dict]:
         """
         获取用户资金费率历史
 
         Args:
             address: 用户地址
+            start_time: 起始时间（毫秒时间戳），默认为0（从最早开始）
+            end_time: 结束时间（毫秒时间戳），默认为None（到当前时间）
 
         Returns:
-            资金费率记录
+            资金费率记录列表
         """
         # 验证地址格式
         if not self._validate_address(address):
@@ -302,16 +309,246 @@ class HyperliquidAPIClient:
             return []
 
         try:
-            # 使用正确的方法名：user_funding_history
+            # 使用正确的方法名：user_funding_history（需要提供 startTime 参数）
             async with self.rate_limiter:
                 async with self.semaphore:
-                    funding = self.info.user_funding_history(address)
-            logger.info(f"获取资金费率: {address} ({len(funding)} 条)")
+                    funding = self.info.user_funding_history(address, start_time, end_time)
+
+            logger.info(f"获取资金费率历史: {address} ({len(funding) if funding else 0} 条)")
             return funding if funding else []
 
         except Exception as e:
             logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
             return []
+
+    async def get_user_ledger(
+        self,
+        address: str,
+        start_time: int = 0,
+        end_time: Optional[int] = None,
+        use_cache: bool = True,
+        enable_pagination: bool = True
+    ) -> List[Dict]:
+        """
+        获取用户出入金记录（非资金费用的账本变动）
+
+        支持自动分页以确保数据完整性。API 限制约 448 条记录，
+        对于活跃账户需要分页查询以获取全部历史。
+
+        Args:
+            address: 用户地址
+            start_time: 起始时间戳（毫秒）
+            end_time: 结束时间戳（毫秒）
+            use_cache: 是否使用缓存
+            enable_pagination: 是否启用分页（默认 True）
+
+        Returns:
+            账本变动列表，包含 send 和 subAccountTransfer 类型
+        """
+        # 优化的缓存键：包含时间范围
+        cache_key = f"user_ledger:{address}:{start_time}:{end_time}"
+
+        # 缓存检查
+        if use_cache:
+            cached = await self.store.get_api_cache(cache_key)
+            if cached:
+                logger.info(f"使用缓存的出入金记录: {address} ({len(cached)} 条)")
+                return cached
+
+        # 如果禁用分页，使用单次查询
+        if not enable_pagination:
+            return await self._get_user_ledger_single(address, start_time, end_time)
+
+        # 分页查询主逻辑
+        all_ledger = []
+        current_start = start_time
+        page = 0
+
+        logger.info(f"[{address}] 开始获取出入金记录...")
+
+        try:
+            while True:
+                # API 调用
+                async with self.rate_limiter:
+                    async with self.semaphore:
+                        ledger = self.info.user_non_funding_ledger_updates(
+                            address, current_start, end_time
+                        )
+
+                # 没有更多数据
+                if not ledger:
+                    logger.info(f"[{address}] 无更多数据，共 {len(all_ledger)} 条")
+                    break
+
+                all_ledger.extend(ledger)
+                page += 1
+                logger.info(f"[{address}] 第 {page} 页: {len(ledger)} 条记录，累计 {len(all_ledger)} 条")
+
+                # 判断是否需要继续分页（阈值 2000，与 get_user_fills 一致）
+                if len(ledger) < 2000:
+                    logger.info(f"[{address}] 已到达最后一页，共获取 {len(all_ledger)} 条记录")
+                    break
+
+                # 计算下一页起始时间
+                last_time = ledger[-1].get('time')
+                if not last_time:
+                    logger.warning(f"[{address}] 无法获取最后一条记录的时间戳，停止翻页")
+                    break
+
+                # +1 毫秒避免重复
+                current_start = last_time + 1
+
+                # 防止 API 限流
+                await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.warning(f"获取 user_non_funding_ledger_updates 失败: {address} - {e}")
+            if not all_ledger:
+                return []
+
+        # 去重处理
+        if all_ledger:
+            all_ledger = self._deduplicate_ledger(all_ledger)
+            logger.info(f"[{address}] 去重后: {len(all_ledger)} 条记录")
+
+        # 更新缓存
+        if use_cache and all_ledger:
+            await self.store.set_api_cache(cache_key, all_ledger, self.cache_ttl_hours)
+
+        return all_ledger
+
+    async def _get_user_ledger_single(
+        self,
+        address: str,
+        start_time: int = 0,
+        end_time: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        单次查询版本（保留用于快速降级）
+
+        仅当 enable_pagination=False 时使用
+
+        Args:
+            address: 用户地址
+            start_time: 起始时间戳（毫秒）
+            end_time: 结束时间戳（毫秒）
+
+        Returns:
+            账本变动列表
+        """
+        try:
+            async with self.rate_limiter:
+                async with self.semaphore:
+                    ledger = self.info.user_non_funding_ledger_updates(
+                        address, start_time, end_time
+                    )
+
+            logger.info(f"获取出入金记录（单次查询）: {address} ({len(ledger) if ledger else 0} 条)")
+            return ledger if ledger else []
+
+        except Exception as e:
+            logger.warning(f"获取 user_non_funding_ledger_updates 失败: {address} - {e}")
+            return []
+
+    def _deduplicate_ledger(self, ledger: List[Dict]) -> List[Dict]:
+        """
+        去重账本记录（基于三元组：时间、哈希、类型）
+
+        分页查询可能产生重复记录，使用三元组确保唯一性
+
+        Args:
+            ledger: 原始账本列表
+
+        Returns:
+            去重后的账本列表（按时间排序）
+        """
+        seen = set()
+        unique_ledger = []
+
+        for record in ledger:
+            # 构建唯一键：(time, hash, delta.type)
+            delta_type = record.get('delta', {}).get('type') if isinstance(record.get('delta'), dict) else None
+            key = (
+                record.get('time'),
+                record.get('hash'),
+                delta_type
+            )
+
+            if key not in seen:
+                seen.add(key)
+                unique_ledger.append(record)
+
+        # 按时间排序（确保数据顺序）
+        unique_ledger.sort(key=lambda x: x.get('time', 0))
+
+        return unique_ledger
+
+    def _classify_ledger_data(self, ledger: List[Dict], target_address: str) -> Dict[str, Any]:
+        """
+        分类出入金数据为流入/流出
+
+        Args:
+            ledger: 账本变动列表
+            target_address: 目标地址（用于判断流向）
+
+        Returns:
+            {
+                'incoming': [...],      # 流入记录
+                'outgoing': [...],      # 流出记录
+                'total_in': float,      # 总流入
+                'total_out': float,     # 总流出
+                'net_flow': float       # 净流入
+            }
+        """
+        incoming = []
+        outgoing = []
+        total_in = 0.0
+        total_out = 0.0
+
+        for record in ledger:
+            delta = record.get('delta', {})
+            record_type = delta.get('type')
+
+            # 提取金额和流向
+            amount = 0.0
+            is_incoming = False
+
+            if record_type == 'send':
+                # send 类型：检查 destination 字段
+                send_data = delta.get('send', {})
+                amount = float(send_data.get('amount', 0))
+                destination = send_data.get('destination', '').lower()
+                user = delta.get('user', '').lower()
+
+                # 如果目标地址是 destination，则为流入；如果是 user，则为流出
+                is_incoming = (destination == target_address.lower())
+
+            elif record_type == 'subAccountTransfer':
+                # subAccountTransfer 类型：检查 user 和 destination
+                transfer_data = delta.get('subAccountTransfer', {})
+                amount = float(transfer_data.get('usdc', 0))
+                destination = transfer_data.get('destination', '').lower()
+                user = delta.get('user', '').lower()
+
+                # 同样判断流向
+                is_incoming = (destination == target_address.lower())
+
+            # 分类统计
+            if amount > 0:
+                if is_incoming:
+                    incoming.append(record)
+                    total_in += amount
+                else:
+                    outgoing.append(record)
+                    total_out += amount
+
+        return {
+            'incoming': incoming,
+            'outgoing': outgoing,
+            'total_in': total_in,
+            'total_out': total_out,
+            'net_flow': total_in - total_out
+        }
 
     async def fetch_address_data(
         self,
@@ -338,11 +575,13 @@ class HyperliquidAPIClient:
         fills_task = self.get_user_fills(address)
         state_task = self.get_user_state(address)
         funding_task = self.get_user_funding(address)
+        ledger_task = self.get_user_ledger(address)
 
-        fills, state, funding = await asyncio.gather(
+        fills, state, funding, ledger = await asyncio.gather(
             fills_task,
             state_task,
             funding_task,
+            ledger_task,
             return_exceptions=True
         )
 
@@ -359,15 +598,23 @@ class HyperliquidAPIClient:
             logger.error(f"获取 funding 异常: {funding}")
             funding = []
 
+        if isinstance(ledger, Exception):
+            logger.error(f"获取 ledger 异常: {ledger}")
+            ledger = []
+
         # 保存到数据库
         if save_to_db and fills:
             await self.store.save_fills(address, fills)
+
+        if save_to_db and ledger:
+            await self.store.save_transfers(address, ledger)
 
         return {
             'address': address,
             'fills': fills,
             'state': state,
-            'funding': funding
+            'funding': funding,
+            'ledger': ledger
         }
 
     async def batch_fetch_addresses(

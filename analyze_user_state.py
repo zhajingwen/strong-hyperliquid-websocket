@@ -11,9 +11,7 @@ async def analyze_user_state():
 
     # 测试地址列表
     addresses = [
-        '0x003e1a30678ada1c01b7043482f1d60207620016',
-        '0x006d8a490e2dbbe570f0d6fa158e997c8251244d',
-        '0x00a0fe44efe83e6a021a0434829e50020ff6002a',
+        "0xde786a32f80731923d6297c14ef43ca1c8fd4b44"
     ]
 
     info = Info(skip_ws=True)
@@ -25,6 +23,7 @@ async def analyze_user_state():
 
         try:
             state = info.user_state(address)
+            print(state)
 
             print("\n📊 完整数据结构:")
             print(json.dumps(state, indent=2, ensure_ascii=False))

@@ -6,7 +6,7 @@ import os
 import json
 import logging
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncpg
 from asyncpg.pool import Pool
 
@@ -360,6 +360,21 @@ class DataStore:
             # 转换为JSON字符串，asyncpg 会将其存储为 JSONB
             await conn.execute(sql, cache_key, json.dumps(data), timedelta(hours=ttl_hours))
 
+    async def delete_api_cache(self, cache_key: str):
+        """
+        删除指定的API缓存
+
+        Args:
+            cache_key: 缓存键
+        """
+        sql = """
+        DELETE FROM api_cache
+        WHERE cache_key = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(sql, cache_key)
+
     async def save_fills(self, address: str, fills: List[Dict]):
         """
         批量保存交易记录
@@ -415,6 +430,103 @@ class DataStore:
                 else:
                     logger.info(f"无新记录需要保存: {address} (全部重复)")
 
+    async def save_transfers(self, address: str, ledger: List[Dict]):
+        """
+        批量保存出入金记录到 transfers 表
+
+        Args:
+            address: 地址
+            ledger: 账本变动列表（来自 user_non_funding_ledger_updates）
+        """
+        if not ledger:
+            return
+
+        records_to_insert = []
+
+        for record in ledger:
+            time_ms = record.get('time', 0)
+            delta = record.get('delta', {})
+            record_type = delta.get('type')
+
+            # 只处理 send 和 subAccountTransfer 类型
+            if record_type not in ['send', 'subAccountTransfer']:
+                continue
+
+            # 提取金额和流向
+            amount = 0.0
+            is_incoming = False
+            tx_hash = record.get('hash', '')
+
+            if record_type == 'send':
+                send_data = delta.get('send', {})
+                amount = float(send_data.get('amount', 0))
+                destination = send_data.get('destination', '').lower()
+                user = delta.get('user', '').lower()
+                is_incoming = (destination == address.lower())
+
+            elif record_type == 'subAccountTransfer':
+                transfer_data = delta.get('subAccountTransfer', {})
+                amount = float(transfer_data.get('usdc', 0))
+                destination = transfer_data.get('destination', '').lower()
+                user = delta.get('user', '').lower()
+                is_incoming = (destination == address.lower())
+
+            # 流入为正数，流出为负数
+            signed_amount = amount if is_incoming else -amount
+
+            if amount > 0:
+                # 转换时间戳为 datetime
+                time_dt = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc)
+
+                records_to_insert.append((
+                    address,
+                    time_dt,
+                    record_type,
+                    signed_amount,
+                    tx_hash
+                ))
+
+        if records_to_insert:
+            async with self.pool.acquire() as conn:
+                sql = """
+                INSERT INTO transfers (address, time, type, amount, tx_hash)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (address, time, tx_hash) DO NOTHING
+                """
+                await conn.executemany(sql, records_to_insert)
+                logger.info(f"保存 {len(records_to_insert)} 条出入金记录: {address}")
+
+    async def get_net_deposits(self, address: str) -> Dict[str, float]:
+        """
+        计算净充值统计
+
+        Args:
+            address: 地址
+
+        Returns:
+            {
+                'total_deposits': float,      # 总充值（amount > 0）
+                'total_withdrawals': float,   # 总提现（amount < 0）
+                'net_deposits': float         # 净充值（总充值 - 总提现）
+            }
+        """
+        sql = """
+        SELECT
+            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) as total_deposits,
+            COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) as total_withdrawals,
+            COALESCE(SUM(amount), 0) as net_deposits
+        FROM transfers
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            return {
+                'total_deposits': float(row['total_deposits']),
+                'total_withdrawals': float(row['total_withdrawals']),
+                'net_deposits': float(row['net_deposits'])
+            }
+
     async def get_fills(self, address: str) -> List[Dict]:
         """
         获取地址的所有交易记录
@@ -446,8 +558,8 @@ class DataStore:
         sql = """
         INSERT INTO metrics_cache (
             address, total_trades, win_rate, roi, sharpe_ratio,
-            total_pnl, account_value, max_drawdown, calculated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            total_pnl, account_value, max_drawdown, net_deposit, calculated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
         ON CONFLICT (address) DO UPDATE
         SET total_trades = EXCLUDED.total_trades,
             win_rate = EXCLUDED.win_rate,
@@ -456,6 +568,7 @@ class DataStore:
             total_pnl = EXCLUDED.total_pnl,
             account_value = EXCLUDED.account_value,
             max_drawdown = EXCLUDED.max_drawdown,
+            net_deposit = EXCLUDED.net_deposit,
             calculated_at = NOW()
         """
 
@@ -469,7 +582,8 @@ class DataStore:
                 metrics.get('sharpe_ratio', 0),
                 metrics.get('total_pnl', 0),
                 metrics.get('account_value', 0),
-                metrics.get('max_drawdown', 0)
+                metrics.get('max_drawdown', 0),
+                metrics.get('net_deposit', 0)
             )
 
     async def get_all_metrics(self) -> List[Dict]:

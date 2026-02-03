@@ -145,7 +145,9 @@ class OutputRenderer:
         table.add_column("地址", style="cyan", width=44, no_wrap=False)
         table.add_column("交易数", justify="right", width=8)
         table.add_column("胜率", justify="right", width=8)
-        table.add_column("ROI", justify="right", width=10)
+        table.add_column("净充值", justify="right", width=12)
+        table.add_column("ROI(旧)", justify="right", width=10)
+        table.add_column("ROI(校准)", justify="right", width=10)
         table.add_column("夏普", justify="right", width=8)
         table.add_column("总PNL", justify="right", width=12)
         table.add_column("账户价值", justify="right", width=12)
@@ -155,14 +157,18 @@ class OutputRenderer:
         for i, metrics in enumerate(metrics_list, 1):
             # 颜色编码
             pnl_color = "green" if metrics.total_pnl > 0 else "red"
-            roi_color = "green" if metrics.roi > 0 else "red"
+            legacy_roi_color = "green" if metrics.roi > 0 else "red"
+            corrected_roi_color = "green" if metrics.corrected_roi > 0 else "red"
+            net_deposit_color = "green" if metrics.net_deposits >= 0 else "yellow"
 
             table.add_row(
                 str(i),
                 metrics.address,
                 str(metrics.total_trades),
                 f"{metrics.win_rate:.1f}%",
-                f"[{roi_color}]{metrics.roi:+.1f}%[/{roi_color}]",
+                f"[{net_deposit_color}]${metrics.net_deposits:,.0f}[/{net_deposit_color}]",
+                f"[{legacy_roi_color}]{metrics.roi:+.1f}%[/{legacy_roi_color}]",
+                f"[{corrected_roi_color}]{metrics.corrected_roi:+.1f}%[/{corrected_roi_color}]",
                 f"{metrics.sharpe_ratio:.2f}",
                 f"[{pnl_color}]${metrics.total_pnl:,.0f}[/{pnl_color}]",
                 f"${metrics.account_value:,.0f}",
@@ -334,7 +340,9 @@ class OutputRenderer:
                     <th>地址</th>
                     <th>交易数</th>
                     <th>胜率</th>
-                    <th>ROI</th>
+                    <th>净充值</th>
+                    <th>ROI(推算)</th>
+                    <th>ROI(校准)</th>
                     <th>夏普比率</th>
                     <th>总PNL</th>
                     <th>账户价值</th>
@@ -348,8 +356,14 @@ class OutputRenderer:
                     <td class="address">{{ m.address }}</td>
                     <td>{{ m.total_trades }}</td>
                     <td>{{ m.win_rate|round(1) }}%</td>
+                    <td class="{% if m.net_deposits >= 0 %}positive{% else %}negative{% endif %}">
+                        ${{ "{:,.0f}".format(m.net_deposits) }}
+                    </td>
                     <td class="{% if m.roi > 0 %}positive{% else %}negative{% endif %}">
                         {{ m.roi|round(1) }}%
+                    </td>
+                    <td class="{% if m.corrected_roi > 0 %}positive{% else %}negative{% endif %}">
+                        {{ m.corrected_roi|round(1) }}%
                     </td>
                     <td>{{ m.sharpe_ratio|round(2) }}</td>
                     <td class="{% if m.total_pnl > 0 %}positive{% else %}negative{% endif %}">

@@ -187,15 +187,19 @@ class Orchestrator:
                 # 获取账户状态（从缓存）
                 state = await self.store.get_api_cache(f"user_state:{addr}")
 
-                # 计算指标
+                # 获取出入金统计
+                transfer_stats = await self.store.get_net_deposits(addr)
+
+                # 计算指标（传入新参数）
                 metrics = self.metrics_engine.calculate_metrics(
                     address=addr,
                     fills=fills,
-                    state=state
+                    state=state,
+                    transfer_data=transfer_stats
                 )
                 all_metrics.append(metrics)
 
-                # 保存到缓存
+                # 保存到缓存（新增 net_deposit 字段）
                 await self.store.save_metrics(addr, {
                     'total_trades': metrics.total_trades,
                     'win_rate': metrics.win_rate,
@@ -203,7 +207,8 @@ class Orchestrator:
                     'sharpe_ratio': metrics.sharpe_ratio,
                     'total_pnl': metrics.total_pnl,
                     'account_value': metrics.account_value,
-                    'max_drawdown': metrics.max_drawdown
+                    'max_drawdown': metrics.max_drawdown,
+                    'net_deposit': metrics.net_deposits
                 })
 
             self.renderer.console.print(f"✅ 计算完成 [bold]{len(all_metrics)}[/bold] 个地址的指标\n")

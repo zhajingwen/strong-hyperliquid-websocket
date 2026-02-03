@@ -17,7 +17,7 @@ class AddressMetrics:
     address: str
     total_trades: int
     win_rate: float          # 胜率 (%)
-    roi: float               # 收益率 (%)
+    roi: float               # 收益率 (%) - 旧版推算初始资金
     sharpe_ratio: float      # 夏普比率
     total_pnl: float         # 总PNL = 已实现PNL (USD)
     account_value: float     # 账户价值 (USD)
@@ -27,6 +27,13 @@ class AddressMetrics:
     first_trade_time: int    # 首次交易时间
     last_trade_time: int     # 最后交易时间
     active_days: int         # 活跃天数
+
+    # 新增：出入金相关字段
+    net_deposits: float = 0.0           # 净充值 (USD)
+    total_deposits: float = 0.0         # 总充值 (USD)
+    total_withdrawals: float = 0.0      # 总提现 (USD)
+    actual_initial_capital: float = 0.0 # 实际初始资金 (USD)
+    corrected_roi: float = 0.0          # 校准后的ROI (%)
 
 
 class MetricsEngine:
@@ -98,44 +105,122 @@ class MetricsEngine:
         return max(0.0, min(100.0, win_rate))
 
     @staticmethod
+    def calculate_actual_initial_capital(
+        account_value: float,
+        realized_pnl: float,
+        net_deposits: float
+    ) -> float:
+        """
+        计算实际初始资金
+
+        公式：实际初始资金 = 当前账户价值 - 已实现PNL - 净充值
+
+        推导逻辑：
+            当前账户 = 初始资金 + 交易盈亏 + 充值 - 提现
+            初始资金 = 当前账户 - 交易盈亏 - (充值 - 提现)
+
+        Args:
+            account_value: 当前账户价值
+            realized_pnl: 已实现PNL
+            net_deposits: 净充值（总充值 - 总提现）
+
+        Returns:
+            实际初始资金，如果计算结果 ≤ 0 则降级到推算初始资金
+        """
+        actual_initial = account_value - realized_pnl - net_deposits
+
+        # 边界保护：如果结果为负或极小值，降级到推算初始资金
+        if actual_initial <= 0:
+            fallback = account_value - realized_pnl
+            logger.warning(
+                f"实际初始资金计算为负 ({actual_initial:.2f})，"
+                f"降级到推算初始资金 ({fallback:.2f})"
+            )
+            return max(fallback, 100.0)  # 最低保证 $100
+
+        return actual_initial
+
+    @staticmethod
+    def calculate_corrected_roi(realized_pnl: float, actual_initial_capital: float) -> float:
+        """
+        计算校准后的ROI
+
+        公式：校准ROI = (已实现PNL / 实际初始资金) × 100
+
+        Args:
+            realized_pnl: 已实现PNL
+            actual_initial_capital: 实际初始资金
+
+        Returns:
+            校准后的ROI (%)
+        """
+        if actual_initial_capital <= 0:
+            return 0.0
+
+        corrected_roi = (realized_pnl / actual_initial_capital) * 100
+
+        # 边界保护
+        return max(-999999.99, min(999999.99, corrected_roi))
+
+    @staticmethod
     def calculate_pnl_and_roi(
         fills: List[Dict],
-        account_value: float
-    ) -> tuple[float, float]:
+        account_value: float,
+        net_deposits: float = 0.0,
+        has_transfer_data: bool = False
+    ) -> tuple[float, float, float, float]:
         """
-        计算总PNL和ROI
+        计算总PNL和ROI（新版返回4个值）
 
         总PNL = 所有交易的已实现PNL之和 (sum of closedPnl)
-        ROI = (已实现PNL / 推算初始资金) * 100
+        Legacy ROI = (已实现PNL / 推算初始资金) * 100
+        Corrected ROI = (已实现PNL / 实际初始资金) * 100
 
         Args:
             fills: 交易记录列表
             account_value: 当前账户价值
+            net_deposits: 净充值（默认0）
+            has_transfer_data: 是否有出入金数据
 
         Returns:
-            (total_pnl, roi)
+            (total_pnl, legacy_roi, actual_initial_capital, corrected_roi)
         """
         if not fills:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
 
         # 计算已实现PNL（所有交易的closedPnl总和）
         realized_pnl = sum(MetricsEngine._get_pnl(fill) for fill in fills)
         total_pnl = realized_pnl
 
-        # 计算ROI：基于推算的初始资金
-        initial_capital = account_value - realized_pnl
-        if initial_capital > 0:
-            roi = (realized_pnl / initial_capital) * 100
+        # 计算旧版ROI：基于推算的初始资金
+        estimated_initial = account_value - realized_pnl
+        if estimated_initial > 0:
+            legacy_roi = (realized_pnl / estimated_initial) * 100
         else:
-            roi = 0.0
+            legacy_roi = 0.0
 
-        # 边界保护：ROI 不应超过 DECIMAL(12,2) 的限制
-        roi = max(-9999999999.99, min(9999999999.99, roi))
+        # 边界保护
+        legacy_roi = max(-999999.99, min(999999.99, legacy_roi))
 
-        return total_pnl, roi
+        # 如果有出入金数据，计算真实初始资金和校准ROI
+        if has_transfer_data:
+            actual_initial = MetricsEngine.calculate_actual_initial_capital(
+                account_value, realized_pnl, net_deposits
+            )
+            corrected_roi = MetricsEngine.calculate_corrected_roi(realized_pnl, actual_initial)
+        else:
+            # 降级策略
+            actual_initial = estimated_initial
+            corrected_roi = legacy_roi
+
+        return total_pnl, legacy_roi, actual_initial, corrected_roi
 
     @staticmethod
-    def calculate_sharpe_ratio(fills: List[Dict], account_value: float) -> float:
+    def calculate_sharpe_ratio(
+        fills: List[Dict],
+        account_value: float,
+        actual_initial_capital: Optional[float] = None
+    ) -> float:
         """
         计算夏普比率（改进版：动态资金基准，考虑复利效应）
 
@@ -143,10 +228,12 @@ class MetricsEngine:
         1. 使用动态资金基准（每笔交易后更新资金）
         2. 考虑复利效应（盈利后资金增长，亏损后资金减少）
         3. 更准确反映策略的真实风险收益特征
+        4. 支持真实初始资金（如果提供出入金数据）
 
         Args:
             fills: 交易记录列表（按时间排序）
-            account_value: 当前账户价值（用于推算初始资金）
+            account_value: 当前账户价值
+            actual_initial_capital: 实际初始资金（可选，有出入金数据时提供）
 
         Returns:
             夏普比率
@@ -166,9 +253,12 @@ class MetricsEngine:
         if not fills or len(fills) < 2:
             return 0.0
 
-        # 推算初始资金
-        realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
-        initial_capital = account_value - realized_pnl
+        # 确定初始资金：优先使用真实初始资金，否则推算
+        if actual_initial_capital is not None and actual_initial_capital > 0:
+            initial_capital = actual_initial_capital
+        else:
+            realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
+            initial_capital = account_value - realized_pnl
 
         # 边界保护：初始资金不应为负或过小
         if initial_capital <= 0:
@@ -244,7 +334,11 @@ class MetricsEngine:
         return float(sharpe)
 
     @staticmethod
-    def calculate_max_drawdown(fills: List[Dict], account_value: float = 0.0) -> float:
+    def calculate_max_drawdown(
+        fills: List[Dict],
+        account_value: float = 0.0,
+        actual_initial_capital: Optional[float] = None
+    ) -> float:
         """
         计算最大回撤（改进版：基于账户权益曲线）
 
@@ -253,10 +347,12 @@ class MetricsEngine:
         2. 基于账户权益曲线（equity = 初始资金 + 累计PNL）
         3. 修复初始峰值可能为负的BUG
         4. 符合行业标准的权益回撤计算方式
+        5. 支持真实初始资金（如果提供出入金数据）
 
         Args:
             fills: 交易记录列表（按时间排序）
-            account_value: 当前账户价值（用于推算初始资金）
+            account_value: 当前账户价值
+            actual_initial_capital: 实际初始资金（可选，有出入金数据时提供）
 
         Returns:
             最大回撤百分比
@@ -277,9 +373,12 @@ class MetricsEngine:
         # 按时间排序
         sorted_fills = sorted(fills, key=lambda x: x.get('time', 0))
 
-        # 推算初始资金
-        realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
-        initial_capital = account_value - realized_pnl
+        # 确定初始资金：优先使用真实初始资金，否则推算
+        if actual_initial_capital is not None and actual_initial_capital > 0:
+            initial_capital = actual_initial_capital
+        else:
+            realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
+            initial_capital = account_value - realized_pnl
 
         # 边界保护：初始资金不应为负或过小
         if initial_capital <= 0:
@@ -468,7 +567,8 @@ class MetricsEngine:
         cls,
         address: str,
         fills: List[Dict],
-        state: Optional[Dict] = None
+        state: Optional[Dict] = None,
+        transfer_data: Optional[Dict] = None
     ) -> AddressMetrics:
         """
         计算地址的完整指标
@@ -477,6 +577,7 @@ class MetricsEngine:
             address: 地址
             fills: 交易记录列表
             state: 账户状态
+            transfer_data: 出入金统计数据 (可选)
 
         Returns:
             AddressMetrics 对象
@@ -504,11 +605,24 @@ class MetricsEngine:
             (state or {}).get('marginSummary', {}).get('accountValue', 0)
         )
 
+        # 提取出入金数据
+        has_transfer_data = transfer_data is not None
+        net_deposits = transfer_data.get('net_deposits', 0.0) if transfer_data else 0.0
+        total_deposits = transfer_data.get('total_deposits', 0.0) if transfer_data else 0.0
+        total_withdrawals = transfer_data.get('total_withdrawals', 0.0) if transfer_data else 0.0
+
         # 计算各项指标
         win_rate = cls.calculate_win_rate(fills)
-        total_pnl, roi = cls.calculate_pnl_and_roi(fills, account_value)
-        sharpe_ratio = cls.calculate_sharpe_ratio(fills, account_value)
-        max_drawdown = cls.calculate_max_drawdown(fills, account_value)
+
+        # 计算PNL和ROI（新版返回4个值）
+        total_pnl, legacy_roi, actual_initial, corrected_roi = cls.calculate_pnl_and_roi(
+            fills, account_value, net_deposits, has_transfer_data
+        )
+
+        # 使用真实初始资金计算夏普比率和最大回撤
+        sharpe_ratio = cls.calculate_sharpe_ratio(fills, account_value, actual_initial)
+        max_drawdown = cls.calculate_max_drawdown(fills, account_value, actual_initial)
+
         avg_trade_size, total_volume = cls.calculate_trade_statistics(fills)
         active_days = cls.calculate_active_days(fills)
 
@@ -517,13 +631,16 @@ class MetricsEngine:
         first_trade_time = sorted_fills[0].get('time', 0)
         last_trade_time = sorted_fills[-1].get('time', 0)
 
-        logger.info(f"指标计算完成: {address} - 胜率:{win_rate:.1f}% ROI:{roi:.1f}%")
+        logger.info(
+            f"指标计算完成: {address} - 胜率:{win_rate:.1f}% "
+            f"ROI(旧):{legacy_roi:.1f}% ROI(校准):{corrected_roi:.1f}%"
+        )
 
         return AddressMetrics(
             address=address,
             total_trades=len(fills),
             win_rate=win_rate,
-            roi=roi,
+            roi=legacy_roi,  # 保留旧版ROI
             sharpe_ratio=sharpe_ratio,
             total_pnl=total_pnl,
             account_value=account_value,
@@ -532,7 +649,13 @@ class MetricsEngine:
             total_volume=total_volume,
             first_trade_time=first_trade_time,
             last_trade_time=last_trade_time,
-            active_days=active_days
+            active_days=active_days,
+            # 新增字段
+            net_deposits=net_deposits,
+            total_deposits=total_deposits,
+            total_withdrawals=total_withdrawals,
+            actual_initial_capital=actual_initial,
+            corrected_roi=corrected_roi
         )
 
 
