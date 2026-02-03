@@ -314,7 +314,7 @@ class MetricsEngine:
             AddressMetrics 对象
         """
         if not fills:
-            logger.warning(f"地址无交易记录: {address[:10]}...")
+            logger.warning(f"地址无交易记录: {address}")
             return AddressMetrics(
                 address=address,
                 total_trades=0,
@@ -357,7 +357,7 @@ class MetricsEngine:
         first_trade_time = sorted_fills[0].get('time', 0)
         last_trade_time = sorted_fills[-1].get('time', 0)
 
-        logger.info(f"指标计算完成: {address[:10]}... - 胜率:{win_rate:.1f}% ROI:{roi:.1f}%")
+        logger.info(f"指标计算完成: {address} - 胜率:{win_rate:.1f}% ROI:{roi:.1f}%")
 
         return AddressMetrics(
             address=address,

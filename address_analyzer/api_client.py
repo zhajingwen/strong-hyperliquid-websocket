@@ -158,9 +158,8 @@ class HyperliquidAPIClient:
         all_fills = []
         start_time = 0  # 从最早的时间开始
         page = 0
-        addr_short = address
 
-        logger.info(f"[{addr_short}] 开始获取用户成交记录...")
+        logger.info(f"[{address}] 开始获取用户成交记录...")
 
         while True:
             async with self.rate_limiter:
@@ -177,22 +176,22 @@ class HyperliquidAPIClient:
 
             # 没有更多数据，退出循环
             if not fills:
-                logger.info(f"[{addr_short}] 已获取所有数据，共 {len(all_fills)} 条记录")
+                logger.info(f"[{address}] 已获取所有数据，共 {len(all_fills)} 条记录")
                 break
 
             all_fills.extend(fills)
             page += 1
-            logger.info(f"[{addr_short}] 第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
+            logger.info(f"[{address}] 第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
 
             # 如果返回的数据少于2000条，说明已经是最后一页
             if len(fills) < 2000:
-                logger.info(f"[{addr_short}] 已到达最后一页，共获取 {len(all_fills)} 条记录")
+                logger.info(f"[{address}] 已到达最后一页，共获取 {len(all_fills)} 条记录")
                 break
 
             # 使用最后一条记录（最新的）的时间戳+1作为下一次的 startTime
             last_fill_time = fills[-1].get("time")
             if last_fill_time is None:
-                logger.warning(f"[{addr_short}] 无法获取最后一条记录的时间戳，停止翻页")
+                logger.warning(f"[{address}] 无法获取最后一条记录的时间戳，停止翻页")
                 break
 
             # 加1毫秒作为下一页的起始时间，避免重复获取同一条记录
@@ -208,7 +207,7 @@ class HyperliquidAPIClient:
         return all_fills
 
         # except Exception as e:
-            # logger.error(f"获取 user_fills 失败: {address[:10]}... - {e}")
+            # logger.error(f"获取 user_fills 失败: {address} - {e}")
             # return []
 
     async def get_user_state(
@@ -246,7 +245,7 @@ class HyperliquidAPIClient:
             async with self.rate_limiter:
                 async with self.semaphore:
                     state = self.info.user_state(address)
-            logger.info(f"获取账户状态: {address[:10]}...")
+            logger.info(f"获取账户状态: {address}")
 
             # 更新缓存
             if use_cache and state:
@@ -255,7 +254,7 @@ class HyperliquidAPIClient:
             return state
 
         except Exception as e:
-            logger.error(f"获取 user_state 失败: {address[:10]}... - {e}")
+            logger.error(f"获取 user_state 失败: {address} - {e}")
             return None
 
     async def get_user_fills_by_time(
@@ -280,11 +279,11 @@ class HyperliquidAPIClient:
             async with self.rate_limiter:
                 async with self.semaphore:
                     fills = self.info.user_fills_by_time(address, start_time, end_time)
-            logger.info(f"获取时间段交易: {address[:10]}... ({len(fills)} 条)")
+            logger.info(f"获取时间段交易: {address} ({len(fills)} 条)")
             return fills
 
         except Exception as e:
-            logger.error(f"获取 user_fills_by_time 失败: {address[:10]}... - {e}")
+            logger.error(f"获取 user_fills_by_time 失败: {address} - {e}")
             return []
 
     async def get_user_funding(self, address: str) -> List[Dict]:
@@ -309,14 +308,14 @@ class HyperliquidAPIClient:
                 async with self.rate_limiter:
                     async with self.semaphore:
                         funding = self.info.user_funding(address)
-                logger.info(f"获取资金费率: {address[:10]}... ({len(funding)} 条)")
+                logger.info(f"获取资金费率: {address} ({len(funding)} 条)")
                 return funding
             else:
                 logger.debug(f"user_funding 方法不可用，跳过")
                 return []
 
         except Exception as e:
-            logger.warning(f"获取 user_funding 失败: {address[:10]}... - {e}")
+            logger.warning(f"获取 user_funding 失败: {address} - {e}")
             return []
 
     async def fetch_address_data(

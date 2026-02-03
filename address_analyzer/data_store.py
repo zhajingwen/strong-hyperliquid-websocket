@@ -411,9 +411,9 @@ class DataStore:
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     """
                     await conn.executemany(sql, records_to_insert)
-                    logger.info(f"保存 {len(records_to_insert)} 条交易记录: {address[:10]}... (跳过 {len(fills) - len(records_to_insert)} 条重复)")
+                    logger.info(f"保存 {len(records_to_insert)} 条交易记录: {address} (跳过 {len(fills) - len(records_to_insert)} 条重复)")
                 else:
-                    logger.info(f"无新记录需要保存: {address[:10]}... (全部重复)")
+                    logger.info(f"无新记录需要保存: {address} (全部重复)")
 
     async def get_fills(self, address: str) -> List[Dict]:
         """
