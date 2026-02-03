@@ -302,20 +302,15 @@ class HyperliquidAPIClient:
             return []
 
         try:
-            # 检查方法是否存在
-            if hasattr(self.info, 'user_funding'):
-                # 应用速率限制
-                async with self.rate_limiter:
-                    async with self.semaphore:
-                        funding = self.info.user_funding(address)
-                logger.info(f"获取资金费率: {address} ({len(funding)} 条)")
-                return funding
-            else:
-                logger.debug(f"user_funding 方法不可用，跳过")
-                return []
+            # 使用正确的方法名：user_funding_history
+            async with self.rate_limiter:
+                async with self.semaphore:
+                    funding = self.info.user_funding_history(address)
+            logger.info(f"获取资金费率: {address} ({len(funding)} 条)")
+            return funding if funding else []
 
         except Exception as e:
-            logger.warning(f"获取 user_funding 失败: {address} - {e}")
+            logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
             return []
 
     async def fetch_address_data(
