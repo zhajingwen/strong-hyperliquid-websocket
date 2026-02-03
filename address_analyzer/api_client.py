@@ -158,8 +158,9 @@ class HyperliquidAPIClient:
         all_fills = []
         start_time = 0  # 从最早的时间开始
         page = 0
+        addr_short = address[:6] + "..." + address[-4:]  # 缩短地址显示
 
-        print(f"→ 开始获取用户成交记录...")
+        logger.info(f"[{addr_short}] 开始获取用户成交记录...")
 
         while True:
             async with self.rate_limiter:
@@ -176,22 +177,22 @@ class HyperliquidAPIClient:
 
             # 没有更多数据，退出循环
             if not fills:
-                print(f"✓ 已获取所有数据，共 {len(all_fills)} 条记录")
+                logger.info(f"[{addr_short}] 已获取所有数据，共 {len(all_fills)} 条记录")
                 break
 
             all_fills.extend(fills)
             page += 1
-            print(f"  第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
+            logger.info(f"[{addr_short}] 第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
 
             # 如果返回的数据少于2000条，说明已经是最后一页
             if len(fills) < 2000:
-                print(f"✓ 已到达最后一页，共获取 {len(all_fills)} 条记录")
+                logger.info(f"[{addr_short}] 已到达最后一页，共获取 {len(all_fills)} 条记录")
                 break
 
             # 使用最后一条记录（最新的）的时间戳+1作为下一次的 startTime
             last_fill_time = fills[-1].get("time")
             if last_fill_time is None:
-                print(f"⚠️  无法获取最后一条记录的时间戳，停止翻页")
+                logger.warning(f"[{addr_short}] 无法获取最后一条记录的时间戳，停止翻页")
                 break
 
             # 加1毫秒作为下一页的起始时间，避免重复获取同一条记录

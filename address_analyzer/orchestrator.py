@@ -144,6 +144,9 @@ class Orchestrator:
                         # 更新状态为完成
                         await self.store.update_processing_status(addr, 'completed')
 
+                        # 标记地址数据已完整获取
+                        await self.store.mark_address_complete(addr)
+
                         progress.advance(task)
                         return data
 

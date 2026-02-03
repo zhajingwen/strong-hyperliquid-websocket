@@ -289,6 +289,23 @@ class DataStore:
         async with self.pool.acquire() as conn:
             await conn.execute(sql, address, status, error_message)
 
+    async def mark_address_complete(self, address: str):
+        """
+        标记地址数据已完整获取
+
+        Args:
+            address: 地址
+        """
+        sql = """
+        UPDATE addresses
+        SET data_complete = TRUE,
+            last_updated = NOW()
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(sql, address)
+
     async def get_api_cache(self, cache_key: str) -> Optional[Dict]:
         """
         获取API缓存
