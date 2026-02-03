@@ -142,7 +142,7 @@ class OutputRenderer:
 
         # 添加列
         table.add_column("#", style="dim", width=4)
-        table.add_column("地址", style="cyan", width=16)
+        table.add_column("地址", style="cyan", width=44, no_wrap=False)
         table.add_column("交易数", justify="right", width=8)
         table.add_column("胜率", justify="right", width=8)
         table.add_column("ROI", justify="right", width=10)
@@ -157,12 +157,9 @@ class OutputRenderer:
             pnl_color = "green" if metrics.total_pnl > 0 else "red"
             roi_color = "green" if metrics.roi > 0 else "red"
 
-            # 地址缩写
-            addr_short = f"{metrics.address[:6]}...{metrics.address[-4:]}"
-
             table.add_row(
                 str(i),
-                addr_short,
+                metrics.address,
                 str(metrics.total_trades),
                 f"{metrics.win_rate:.1f}%",
                 f"[{roi_color}]{metrics.roi:+.1f}%[/{roi_color}]",
@@ -272,7 +269,11 @@ class OutputRenderer:
         tr:hover { background: #252d3f; }
         .positive { color: #00ff88; }
         .negative { color: #ff4444; }
-        .address { font-family: monospace; }
+        .address {
+            font-family: monospace;
+            word-break: break-all;
+            max-width: 400px;
+        }
         .footer {
             text-align: center;
             margin-top: 30px;
@@ -344,7 +345,7 @@ class OutputRenderer:
                 {% for m in metrics %}
                 <tr>
                     <td>{{ loop.index }}</td>
-                    <td class="address">{{ m.address[:10] }}...{{ m.address[-8:] }}</td>
+                    <td class="address">{{ m.address }}</td>
                     <td>{{ m.total_trades }}</td>
                     <td>{{ m.win_rate|round(1) }}%</td>
                     <td class="{% if m.roi > 0 %}positive{% else %}negative{% endif %}">
