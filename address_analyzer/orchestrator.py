@@ -187,19 +187,23 @@ class Orchestrator:
                 # 获取账户状态（从缓存）
                 state = await self.store.get_api_cache(f"user_state:{addr}")
 
+                # 获取 Spot 账户状态（从缓存）
+                spot_state = await self.store.get_api_cache(f"spot_state:{addr}")
+
                 # 获取出入金统计
                 transfer_stats = await self.store.get_net_deposits(addr)
 
-                # 计算指标（传入新参数）
+                # 计算指标（传入新参数，包括 spot_state）
                 metrics = self.metrics_engine.calculate_metrics(
                     address=addr,
                     fills=fills,
                     state=state,
-                    transfer_data=transfer_stats
+                    transfer_data=transfer_stats,
+                    spot_state=spot_state
                 )
                 all_metrics.append(metrics)
 
-                # 保存到缓存（新增 net_deposit 字段）
+                # 保存到缓存（包含 Perp/Spot 分解）
                 await self.store.save_metrics(addr, {
                     'total_trades': metrics.total_trades,
                     'win_rate': metrics.win_rate,
@@ -207,6 +211,8 @@ class Orchestrator:
                     'sharpe_ratio': metrics.sharpe_ratio,
                     'total_pnl': metrics.total_pnl,
                     'account_value': metrics.account_value,
+                    'perp_value': metrics.perp_value,
+                    'spot_value': metrics.spot_value,
                     'max_drawdown': metrics.max_drawdown,
                     'net_deposit': metrics.net_deposits
                 })

@@ -25,7 +25,9 @@
       "WebSearch",
       "Bash(pip install:*)",
       "Bash(pip3 install:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "WebFetch(domain:hyperliquid.gitbook.io)",
+      "Bash(git checkout:*)"
     ]
   }
 }

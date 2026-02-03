@@ -216,7 +216,7 @@ class HyperliquidAPIClient:
         use_cache: bool = True
     ) -> Optional[Dict]:
         """
-        获取账户状态（user_state API）
+        获取账户状态（user_state API）- 仅返回 Perp 账户状态
 
         Args:
             address: 用户地址
@@ -255,6 +255,56 @@ class HyperliquidAPIClient:
 
         except Exception as e:
             logger.error(f"获取 user_state 失败: {address} - {e}")
+            return None
+
+    async def get_spot_state(
+        self,
+        address: str,
+        use_cache: bool = True
+    ) -> Optional[Dict]:
+        """
+        获取 Spot 账户状态（spotClearinghouseState API）
+
+        Args:
+            address: 用户地址
+            use_cache: 是否使用缓存
+
+        Returns:
+            Spot 账户状态数据，包含 balances 字段
+        """
+        # 验证地址格式
+        if not self._validate_address(address):
+            logger.error(f"无效的地址格式: {address}")
+            return None
+
+        cache_key = f"spot_state:{address}"
+
+        # 检查缓存
+        if use_cache:
+            cached = await self.store.get_api_cache(cache_key)
+            if cached:
+                self.stats['cache_hits'] += 1
+                logger.debug(f"缓存命中: {cache_key}")
+                return cached
+
+        # 使用 Hyperliquid SDK 的 post 方法获取 Spot 账户状态
+        try:
+            async with self.rate_limiter:
+                async with self.semaphore:
+                    spot_state = self.info.post("/info", {
+                        "type": "spotClearinghouseState",
+                        "user": address
+                    })
+            logger.info(f"获取 Spot 账户状态: {address}")
+
+            # 更新缓存
+            if use_cache and spot_state:
+                await self.store.set_api_cache(cache_key, spot_state, self.cache_ttl_hours)
+
+            return spot_state
+
+        except Exception as e:
+            logger.error(f"获取 spotClearinghouseState 失败: {address} - {e}")
             return None
 
     async def get_user_funding(
@@ -682,15 +732,17 @@ class HyperliquidAPIClient:
         """
         logger.info(f"开始获取地址数据: {address}")
 
-        # 并发获取多个 API
+        # 并发获取多个 API（包括 Spot 账户状态）
         fills_task = self.get_user_fills(address)
         state_task = self.get_user_state(address)
+        spot_state_task = self.get_spot_state(address)
         funding_task = self.get_user_funding(address)
         ledger_task = self.get_user_ledger(address)
 
-        fills, state, funding, ledger = await asyncio.gather(
+        fills, state, spot_state, funding, ledger = await asyncio.gather(
             fills_task,
             state_task,
+            spot_state_task,
             funding_task,
             ledger_task,
             return_exceptions=True
@@ -704,6 +756,10 @@ class HyperliquidAPIClient:
         if isinstance(state, Exception):
             logger.error(f"获取 state 异常: {state}")
             state = None
+
+        if isinstance(spot_state, Exception):
+            logger.error(f"获取 spot_state 异常: {spot_state}")
+            spot_state = None
 
         if isinstance(funding, Exception):
             logger.error(f"获取 funding 异常: {funding}")
@@ -724,6 +780,7 @@ class HyperliquidAPIClient:
             'address': address,
             'fills': fills,
             'state': state,
+            'spot_state': spot_state,
             'funding': funding,
             'ledger': ledger
         }

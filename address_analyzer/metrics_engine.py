@@ -20,7 +20,7 @@ class AddressMetrics:
     roi: float               # 收益率 (%) - 旧版推算初始资金
     sharpe_ratio: float      # 夏普比率
     total_pnl: float         # 总PNL = 已实现PNL (USD)
-    account_value: float     # 账户价值 (USD)
+    account_value: float     # 账户价值 (USD) - Perp + Spot 总和
     max_drawdown: float      # 最大回撤 (%)
     avg_trade_size: float    # 平均交易规模
     total_volume: float      # 总交易量
@@ -28,7 +28,11 @@ class AddressMetrics:
     last_trade_time: int     # 最后交易时间
     active_days: int         # 活跃天数
 
-    # 新增：出入金相关字段
+    # 账户价值分解（新增）
+    perp_value: float = 0.0  # Perp 账户价值 (USD)
+    spot_value: float = 0.0  # Spot 账户价值 (USD)
+
+    # 出入金相关字段
     net_deposits: float = 0.0           # 净充值 (USD) - 仅 deposit/withdraw
     total_deposits: float = 0.0         # 总充值 (USD)
     total_withdrawals: float = 0.0      # 总提现 (USD)
@@ -62,10 +66,22 @@ class AddressMetrics:
     total_roi: float = 0.0                 # 总ROI（含未实现盈亏）
     roi_quality: str = "estimated"         # ROI质量：actual|estimated
 
+    # 累计收益率指标（新增）
+    initial_capital_corrected: float = 0.0 # 校正后的账户初始值（含外部转入）
+    cumulative_return: float = 0.0         # 累计收益率（%）
+    annualized_return: float = 0.0         # 年化收益率（%）复利计算
+
     # Sharpe比率扩展指标（P2优化新增）
     sharpe_quality: str = "estimated"      # Sharpe质量：enhanced|standard|estimated|estimated_fallback
     funding_pnl: float = 0.0               # 资金费率盈亏（USD）
     funding_contribution: float = 0.0      # 资金费率贡献百分比（%）
+
+    # 回撤期间分析（P2优化新增）
+    drawdown_periods_count: int = 0        # 回撤期间总数
+    avg_drawdown_duration_days: float = 0.0  # 平均回撤持续天数
+    avg_recovery_days: float = 0.0         # 平均恢复天数
+    longest_drawdown_days: int = 0         # 最长回撤持续天数
+    current_in_drawdown: bool = False      # 当前是否处于回撤中
 
 
 class MetricsEngine:
@@ -1203,7 +1219,8 @@ class MetricsEngine:
             'drawdown_count': drawdown_count,
             'largest_drawdown_pct': largest_dd_pct,
             'improvement_pct': legacy_dd - max_drawdown_pct if legacy_dd > max_drawdown_pct else 0.0,
-            'max_drawdown_with_unrealized': max_drawdown_with_unrealized_pct  # P1新增
+            'max_drawdown_with_unrealized': max_drawdown_with_unrealized_pct,  # P1新增
+            'equity_curve': equity_curve  # P2新增：用于回撤期间分析
         }
 
         # 日志记录改进效果
@@ -1215,6 +1232,150 @@ class MetricsEngine:
             )
 
         return max_drawdown_pct, details
+
+    @classmethod
+    def analyze_drawdown_periods(
+        cls,
+        equity_curve: List[Dict],
+        fills: List[Dict]
+    ) -> Dict:
+        """
+        分析回撤期间详情（P2优化）
+
+        识别所有回撤期间，计算恢复时间，分析回撤原因
+
+        Args:
+            equity_curve: 权益曲线数据
+            fills: 交易记录列表
+
+        Returns:
+            回撤期间分析详情
+        """
+        if not equity_curve:
+            return {
+                'periods': [],
+                'total_periods': 0,
+                'avg_duration_days': 0.0,
+                'avg_recovery_days': 0.0,
+                'longest_duration_days': 0,
+                'current_in_drawdown': False
+            }
+
+        # 1. 识别回撤期间
+        periods = []
+        current_period = None
+        previous_peak = 0.0
+        previous_peak_time = 0
+
+        for i, point in enumerate(equity_curve):
+            equity = point['equity']
+            peak = point['peak']
+            time = point['time']
+            drawdown = point['drawdown']
+
+            # 检测回撤开始
+            if drawdown > 0.01 and current_period is None:  # 超过1%开始记录
+                current_period = {
+                    'start_time': time,
+                    'start_equity': equity,
+                    'peak_value': peak,
+                    'peak_time': previous_peak_time,
+                    'trough_value': equity,
+                    'trough_time': time,
+                    'max_drawdown_pct': drawdown * 100,
+                    'recovered': False,
+                    'recovery_time': None,
+                    'duration_days': 0,
+                    'recovery_days': 0
+                }
+
+            # 更新回撤期间的谷底
+            if current_period and equity < current_period['trough_value']:
+                current_period['trough_value'] = equity
+                current_period['trough_time'] = time
+                current_period['max_drawdown_pct'] = drawdown * 100
+
+            # 检测回撤结束（恢复到峰值）
+            if current_period and equity >= current_period['peak_value']:
+                current_period['recovered'] = True
+                current_period['recovery_time'] = time
+
+                # 计算持续时间
+                duration_ms = current_period['trough_time'] - current_period['start_time']
+                current_period['duration_days'] = duration_ms / (1000 * 86400)
+
+                # 计算恢复时间
+                recovery_ms = time - current_period['trough_time']
+                current_period['recovery_days'] = recovery_ms / (1000 * 86400)
+
+                periods.append(current_period)
+                current_period = None
+
+            # 更新峰值
+            if equity > previous_peak:
+                previous_peak = equity
+                previous_peak_time = time
+
+        # 处理未恢复的回撤
+        if current_period:
+            current_period['recovered'] = False
+            duration_ms = current_period['trough_time'] - current_period['start_time']
+            current_period['duration_days'] = duration_ms / (1000 * 86400)
+            current_period['recovery_days'] = 0
+            periods.append(current_period)
+
+        # 2. 统计分析
+        total_periods = len(periods)
+        current_in_drawdown = current_period is not None
+
+        if total_periods > 0:
+            # 平均回撤持续天数
+            avg_duration = sum(p['duration_days'] for p in periods) / total_periods
+
+            # 平均恢复天数（只统计已恢复的）
+            recovered_periods = [p for p in periods if p['recovered']]
+            avg_recovery = (
+                sum(p['recovery_days'] for p in recovered_periods) / len(recovered_periods)
+                if recovered_periods else 0.0
+            )
+
+            # 最长回撤持续天数
+            longest_duration = max(p['duration_days'] for p in periods)
+        else:
+            avg_duration = 0.0
+            avg_recovery = 0.0
+            longest_duration = 0
+
+        # 3. 为每个回撤期间添加交易统计
+        for period in periods:
+            # 确定期间结束时间
+            end_time = period.get('recovery_time') if period.get('recovered') else period.get('trough_time', 0)
+            if end_time is None:
+                end_time = period.get('trough_time', 0)
+
+            period_fills = [
+                f for f in fills
+                if period['start_time'] <= f.get('time', 0) <= end_time
+            ]
+
+            if period_fills:
+                losing_trades = [f for f in period_fills if MetricsEngine._get_pnl(f) < 0]
+                period['trades_count'] = len(period_fills)
+                period['losing_trades_count'] = len(losing_trades)
+                period['total_loss'] = sum(MetricsEngine._get_pnl(f) for f in losing_trades)
+            else:
+                period['trades_count'] = 0
+                period['losing_trades_count'] = 0
+                period['total_loss'] = 0.0
+
+        return {
+            'periods': periods,
+            'total_periods': total_periods,
+            'avg_duration_days': avg_duration,
+            'avg_recovery_days': avg_recovery,
+            'longest_duration_days': int(longest_duration),
+            'current_in_drawdown': current_in_drawdown
+        }
 
     @staticmethod
     def calculate_trade_statistics(fills: List[Dict]) -> tuple[float, float]:
@@ -1406,12 +1567,75 @@ class MetricsEngine:
         return bankruptcy_count
 
     @classmethod
+    def calculate_initial_capital_corrected(
+        cls,
+        address: str,
+        ledger_data: List[Dict],
+        total_deposits: float,
+        total_withdrawals: float
+    ) -> tuple[float, float, float]:
+        """
+        计算校正后的账户初始值（包含外部转入到 Spot）
+
+        Args:
+            address: 用户地址
+            ledger_data: 账本数据
+            total_deposits: 总充值
+            total_withdrawals: 总提现
+
+        Returns:
+            (校正后的初始值, 外部转入Spot, 外部转出)
+        """
+        if not ledger_data:
+            return total_deposits - total_withdrawals, 0.0, 0.0
+
+        addr_lower = address.lower()
+        external_to_spot = 0.0
+        external_out = 0.0
+
+        for record in ledger_data:
+            delta = record.get('delta', {})
+            if delta.get('type') != 'send':
+                continue
+
+            amount = float(delta.get('amount', 0))
+            user = delta.get('user', '').lower()
+            dest = delta.get('destination', '').lower()
+            dest_dex = delta.get('destinationDex', '')
+            source_dex = delta.get('sourceDex', '')
+
+            # 外部转入到 Spot
+            if user != addr_lower and dest == addr_lower and dest_dex == 'spot':
+                external_to_spot += amount
+                logger.debug(f"外部转入 Spot: ${amount:,.2f}")
+
+            # 外部转出
+            elif user == addr_lower and dest != addr_lower:
+                external_out += amount
+                logger.debug(f"外部转出: ${amount:,.2f}")
+
+        # 校正后的初始值 = 充值 - 提现 + 外部转入Spot - 外部转出
+        initial_capital_corrected = (
+            total_deposits - total_withdrawals +
+            external_to_spot - external_out
+        )
+
+        logger.info(
+            f"账户初始值校正: 充值${total_deposits:,.2f} - 提现${total_withdrawals:,.2f} + "
+            f"外部转入Spot${external_to_spot:,.2f} - 外部转出${external_out:,.2f} = "
+            f"${initial_capital_corrected:,.2f}"
+        )
+
+        return initial_capital_corrected, external_to_spot, external_out
+
+    @classmethod
     def calculate_metrics(
         cls,
         address: str,
         fills: List[Dict],
         state: Optional[Dict] = None,
-        transfer_data: Optional[Dict] = None
+        transfer_data: Optional[Dict] = None,
+        spot_state: Optional[Dict] = None
     ) -> AddressMetrics:
         """
         计算地址的完整指标
@@ -1419,8 +1643,9 @@ class MetricsEngine:
         Args:
             address: 地址
             fills: 交易记录列表
-            state: 账户状态
+            state: 账户状态（Perp 账户）
             transfer_data: 出入金统计数据 (可选)
+            spot_state: Spot 账户状态 (可选)
 
         Returns:
             AddressMetrics 对象
@@ -1435,6 +1660,8 @@ class MetricsEngine:
                 sharpe_ratio=0.0,
                 total_pnl=0.0,
                 account_value=0.0,
+                perp_value=0.0,
+                spot_value=0.0,
                 max_drawdown=0.0,
                 avg_trade_size=0.0,
                 total_volume=0.0,
@@ -1443,10 +1670,31 @@ class MetricsEngine:
                 active_days=0
             )
 
-        # 获取账户价值
-        account_value = float(
+        # 获取 Perp 账户价值
+        perp_value = float(
             (state or {}).get('marginSummary', {}).get('accountValue', 0)
         )
+
+        # 获取 Spot 账户价值
+        spot_value = 0.0
+        if spot_state and 'balances' in spot_state:
+            for balance in spot_state['balances']:
+                coin = balance.get('coin', '')
+                total = float(balance.get('total', 0))
+
+                if total > 0:
+                    if coin == 'USDC':
+                        # USDC 按 1:1 计价
+                        spot_value += total
+                    else:
+                        # 其他代币使用 entryNtl（入账价值）
+                        entry_ntl = float(balance.get('entryNtl', 0))
+                        spot_value += entry_ntl
+
+        # 计算总账户价值 = Perp + Spot
+        account_value = perp_value + spot_value
+
+        logger.info(f"账户价值计算: Perp=${perp_value:,.2f}, Spot=${spot_value:,.2f}, 总计=${account_value:,.2f}")
 
         # 提取出入金数据
         has_transfer_data = transfer_data is not None
@@ -1504,8 +1752,69 @@ class MetricsEngine:
 
             roi_quality = 'estimated'
 
-        # 使用真实初始资金计算夏普比率（P2优化：集成出入金和资金费率）
+        # 计算校正后的账户初始值（包含外部转入到 Spot）
         ledger_data = transfer_data.get('ledger', None) if transfer_data else None
+        if ledger_data and has_transfer_data:
+            initial_capital_corrected, external_to_spot, external_out = cls.calculate_initial_capital_corrected(
+                address, ledger_data, total_deposits, total_withdrawals
+            )
+        else:
+            initial_capital_corrected = true_capital
+            external_to_spot = 0.0
+            external_out = 0.0
+
+        # 计算累计收益率和年化收益率
+        cumulative_return = 0.0
+        annualized_return = 0.0
+
+        if initial_capital_corrected > 0:
+            # 累计收益 = 当前账户价值 - 账户初始值
+            cumulative_profit = account_value - initial_capital_corrected
+
+            # 累计收益率 = 累计收益 / 账户初始值 × 100%
+            cumulative_return = (cumulative_profit / initial_capital_corrected) * 100
+
+            # 计算年化收益率（复利计算）
+            sorted_fills_for_return = cls._ensure_sorted_fills(fills)
+            total_days = (
+                (sorted_fills_for_return[-1].get('time', 0) - sorted_fills_for_return[0].get('time', 0)) / (1000 * 86400)
+                if len(sorted_fills_for_return) > 0 else 1
+            )
+            years = max(total_days / 365, 1/365)
+
+            # 保护机制：对于活跃时间太短的账户，年化收益率可能不准确
+            MIN_DAYS_FOR_ANNUALIZED = 30  # 至少30天才计算年化收益率
+            MAX_ANNUALIZED_RETURN = 10000.0  # 年化收益率上限 ±10000%
+
+            if total_days < MIN_DAYS_FOR_ANNUALIZED:
+                # 活跃时间太短，使用简单年化公式而非复利
+                annualized_return = cumulative_return * (365 / total_days) if total_days > 0 else 0.0
+                # 仍然应用上限
+                annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
+            elif years > 0:
+                # 年化收益率 = (当前价值 / 初始值) ^ (1 / 年数) - 1
+                total_return_rate = account_value / initial_capital_corrected
+                try:
+                    annualized_return = (total_return_rate ** (1/years) - 1) * 100
+                    # 应用上限防止数值溢出
+                    annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
+                except (OverflowError, ValueError):
+                    # 如果计算溢出，使用简单年化
+                    annualized_return = cumulative_return * (365 / total_days) if total_days > 0 else 0.0
+                    annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
+            else:
+                annualized_return = cumulative_return
+
+            logger.info(
+                f"累计收益率计算: 初始值=${initial_capital_corrected:,.2f}, "
+                f"当前值=${account_value:,.2f}, "
+                f"累计收益率={cumulative_return:.2f}%, "
+                f"年化收益率={annualized_return:.2f}%"
+            )
+        else:
+            logger.warning(f"账户初始值为0，无法计算累计收益率")
+
+        # 使用真实初始资金计算夏普比率（P2优化：集成出入金和资金费率）
         sharpe_ratio, sharpe_details = cls.calculate_sharpe_ratio_enhanced(
             fills, account_value, actual_initial, ledger_data, address, state
         )
@@ -1514,6 +1823,14 @@ class MetricsEngine:
         max_drawdown, dd_details = cls.calculate_max_drawdown(
             fills, account_value, actual_initial, ledger_data, address, state  # P1: 传入state
         )
+
+        # 回撤期间详细分析（P2优化）
+        dd_periods_analysis = {'total_periods': 0, 'avg_duration_days': 0.0, 'avg_recovery_days': 0.0, 'longest_duration_days': 0, 'current_in_drawdown': False}
+        if 'equity_curve' in dd_details and dd_details['equity_curve']:
+            dd_periods_analysis = cls.analyze_drawdown_periods(
+                dd_details['equity_curve'],
+                fills
+            )
 
         # 检测爆仓次数
         bankruptcy_count = cls.detect_bankruptcy(fills, account_value, actual_initial)
@@ -1539,6 +1856,8 @@ class MetricsEngine:
             sharpe_ratio=sharpe_ratio,
             total_pnl=total_pnl,
             account_value=account_value,
+            perp_value=perp_value,
+            spot_value=spot_value,
             max_drawdown=max_drawdown,
             avg_trade_size=avg_trade_size,
             total_volume=total_volume,
@@ -1573,147 +1892,18 @@ class MetricsEngine:
             annualized_roi=annualized_roi,
             total_roi=total_roi,
             roi_quality=roi_quality,
+            # 累计收益率指标（新增）
+            initial_capital_corrected=initial_capital_corrected,
+            cumulative_return=cumulative_return,
+            annualized_return=annualized_return,
             # Sharpe比率扩展指标（P2优化）
             sharpe_quality=sharpe_details.get('quality', 'estimated'),
             funding_pnl=sharpe_details.get('funding_pnl', 0.0),
-            funding_contribution=sharpe_details.get('funding_contribution', 0.0)
+            funding_contribution=sharpe_details.get('funding_contribution', 0.0),
+            # 回撤期间分析（P2优化）
+            drawdown_periods_count=dd_periods_analysis['total_periods'],
+            avg_drawdown_duration_days=dd_periods_analysis['avg_duration_days'],
+            avg_recovery_days=dd_periods_analysis['avg_recovery_days'],
+            longest_drawdown_days=dd_periods_analysis['longest_duration_days'],
+            current_in_drawdown=dd_periods_analysis['current_in_drawdown']
         )
-
-
-def test_metrics():
-    """测试指标计算"""
-    print(f"\n{'='*70}")
-    print(f"🧪 指标计算测试 - P0改进效果验证")
-    print(f"{'='*70}\n")
-
-    # 测试1：胜率算法改进
-    print("📊 测试1：胜率算法改进对比")
-    print("-" * 70)
-    test_fills_with_zeros = [
-        {'time': 1704067200000, 'closedPnl': '100', 'px': '50000', 'sz': '0.1'},   # 盈利
-        {'time': 1704153600000, 'closedPnl': '-50', 'px': '50100', 'sz': '0.1'},   # 亏损
-        {'time': 1704240000000, 'closedPnl': '0', 'px': '50200', 'sz': '0.2'},     # 零PNL（开仓）
-        {'time': 1704326400000, 'closedPnl': '0', 'px': '50300', 'sz': '0.15'},    # 零PNL（开仓）
-        {'time': 1704412800000, 'closedPnl': '200', 'px': '50400', 'sz': '0.1'},   # 盈利
-    ]
-
-    detailed_stats = MetricsEngine.calculate_win_rate_detailed(test_fills_with_zeros)
-
-    print(f"总交易数: {detailed_stats['total_trades']} 笔")
-    print(f"  - 盈利交易: {detailed_stats['winning_trades']} 笔")
-    print(f"  - 亏损交易: {detailed_stats['losing_trades']} 笔")
-    print(f"  - 零PNL交易: {detailed_stats['zero_pnl_trades']} 笔（开仓/部分平仓）")
-    print(f"\n胜率计算:")
-    print(f"  - 旧算法（错误）: {detailed_stats['winning_trades']}/{detailed_stats['total_trades']} = {detailed_stats['winning_trades']/detailed_stats['total_trades']*100:.1f}%")
-    print(f"  - 新算法（正确）: {detailed_stats['winning_trades']}/{detailed_stats['winning_trades']+detailed_stats['losing_trades']} = {detailed_stats['win_rate']:.1f}%")
-    print(f"  - 差异: {detailed_stats['win_rate'] - detailed_stats['winning_trades']/detailed_stats['total_trades']*100:.1f}%")
-
-    # 测试2：Sharpe Ratio 改进（动态资金基准）
-    print(f"\n{'='*70}")
-    print(f"📊 测试2：Sharpe Ratio 改进对比（动态 vs 固定资金基准）")
-    print("-" * 70)
-
-    # 构造有明显复利效应的数据
-    test_fills_compound = [
-        {'time': 1704067200000, 'closedPnl': '200', 'px': '50000', 'sz': '0.2'},   # +200 (资金1000->1200)
-        {'time': 1704153600000, 'closedPnl': '300', 'px': '50100', 'sz': '0.3'},   # +300 (资金1200->1500)
-        {'time': 1704240000000, 'closedPnl': '-150', 'px': '50200', 'sz': '0.15'}, # -150 (资金1500->1350)
-        {'time': 1704326400000, 'closedPnl': '400', 'px': '50300', 'sz': '0.4'},   # +400 (资金1350->1750)
-        {'time': 1704412800000, 'closedPnl': '250', 'px': '50400', 'sz': '0.25'},  # +250 (资金1750->2000)
-    ]
-
-    account_val = 2000.0  # 最终账户价值
-
-    # 计算新算法的夏普比率
-    sharpe_new = MetricsEngine.calculate_sharpe_ratio(test_fills_compound, account_val)
-
-    print(f"交易序列（展示复利效应）:")
-    running = 1000
-    for i, fill in enumerate(test_fills_compound, 1):
-        pnl = float(fill['closedPnl'])
-        ret_new = pnl / running
-        running += pnl
-        print(f"  第{i}笔: PNL=${pnl:+.0f}, 资金基准=${running-pnl:.0f}, 收益率={ret_new*100:.1f}%, 新资金=${running:.0f}")
-
-    print(f"\n夏普比率:")
-    print(f"  - 新算法（动态资金基准）: {sharpe_new:.4f}")
-    print(f"  - 优势: 考虑复利效应，更准确反映风险收益")
-
-    # 测试3：Max Drawdown 改进（基于权益曲线）
-    print(f"\n{'='*70}")
-    print(f"📊 测试3：Max Drawdown 改进对比（权益曲线 vs 累计PNL）")
-    print("-" * 70)
-
-    test_fills_dd = [
-        {'time': 1704067200000, 'closedPnl': '500', 'px': '50000', 'sz': '0.5'},   # 峰值
-        {'time': 1704153600000, 'closedPnl': '-300', 'px': '50100', 'sz': '0.3'},  # 回撤
-        {'time': 1704240000000, 'closedPnl': '-200', 'px': '50200', 'sz': '0.2'},  # 继续回撤
-        {'time': 1704326400000, 'closedPnl': '400', 'px': '50300', 'sz': '0.4'},   # 恢复
-    ]
-
-    account_val_dd = 1400.0
-    max_dd = MetricsEngine.calculate_max_drawdown(test_fills_dd, account_val_dd)
-
-    # 构建权益曲线展示
-    realized_pnl = sum(float(f['closedPnl']) for f in test_fills_dd)
-    initial = account_val_dd - realized_pnl
-    print(f"初始资金: ${initial:.0f}")
-    print(f"权益曲线:")
-    equity = initial
-    peak = initial
-    for i, fill in enumerate(test_fills_dd, 1):
-        pnl = float(fill['closedPnl'])
-        equity += pnl
-        if equity > peak:
-            peak = equity
-        dd = (peak - equity) / peak * 100 if peak > 0 else 0
-        print(f"  第{i}笔后: 权益=${equity:.0f}, 峰值=${peak:.0f}, 回撤={dd:.1f}%")
-
-    print(f"\n最大回撤:")
-    print(f"  - 新算法（基于权益曲线）: {max_dd:.1f}%")
-    print(f"  - 优势: 从初始资金开始，避免负峰值BUG")
-
-    # 测试4：完整指标计算
-    print(f"\n{'='*70}")
-    print(f"📊 测试4：完整指标计算")
-    print("-" * 70)
-    test_fills = [
-        {'time': 1704067200000, 'closedPnl': '100', 'px': '50000', 'sz': '0.1'},
-        {'time': 1704153600000, 'closedPnl': '-50', 'px': '50100', 'sz': '0.1'},
-        {'time': 1704240000000, 'closedPnl': '200', 'px': '50200', 'sz': '0.2'},
-        {'time': 1704326400000, 'closedPnl': '150', 'px': '50300', 'sz': '0.15'},
-        {'time': 1704412800000, 'closedPnl': '-30', 'px': '50400', 'sz': '0.1'},
-    ]
-
-    test_state = {
-        'marginSummary': {
-            'accountValue': '10500'
-        }
-    }
-
-    metrics = MetricsEngine.calculate_metrics(
-        address='0xtest123',
-        fills=test_fills,
-        state=test_state
-    )
-
-    print(f"地址: {metrics.address}")
-    print(f"总交易数: {metrics.total_trades}")
-    print(f"胜率: {metrics.win_rate:.1f}% (✅ 排除零PNL)")
-    print(f"ROI: {metrics.roi:.1f}%")
-    print(f"夏普比率: {metrics.sharpe_ratio:.2f} (✅ 动态资金基准)")
-    print(f"总PNL: ${metrics.total_pnl:,.2f}")
-    print(f"账户价值: ${metrics.account_value:,.2f}")
-    print(f"最大回撤: {metrics.max_drawdown:.1f}% (✅ 权益曲线)")
-    print(f"平均交易规模: ${metrics.avg_trade_size:,.2f}")
-    print(f"总交易量: ${metrics.total_volume:,.2f}")
-    print(f"活跃天数: {metrics.active_days}")
-
-    print(f"\n{'='*70}")
-    print(f"✅ P0改进验证完成！")
-    print(f"{'='*70}")
-
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    test_metrics()
