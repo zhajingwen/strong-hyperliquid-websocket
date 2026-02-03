@@ -257,48 +257,26 @@ class HyperliquidAPIClient:
             logger.error(f"获取 user_state 失败: {address} - {e}")
             return None
 
-    async def get_user_fills_by_time(
-        self,
-        address: str,
-        start_time: int,
-        end_time: Optional[int] = None
-    ) -> List[Dict]:
-        """
-        获取指定时间段的交易记录（分页查询）
-
-        Args:
-            address: 用户地址
-            start_time: 开始时间（毫秒时间戳）
-            end_time: 结束时间（毫秒时间戳，可选）
-
-        Returns:
-            交易记录列表
-        """
-        try:
-            # Hyperliquid SDK 的 user_fills_by_time 方法 - 应用速率限制
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    fills = self.info.user_fills_by_time(address, start_time, end_time)
-            logger.info(f"获取时间段交易: {address} ({len(fills)} 条)")
-            return fills
-
-        except Exception as e:
-            logger.error(f"获取 user_fills_by_time 失败: {address} - {e}")
-            return []
-
     async def get_user_funding(
         self,
         address: str,
         start_time: int = 0,
-        end_time: Optional[int] = None
+        end_time: Optional[int] = None,
+        use_cache: bool = True,
+        enable_pagination: bool = True
     ) -> List[Dict]:
         """
-        获取用户资金费率历史
+        获取用户资金费率历史（支持缓存和分页）
+
+        支持自动分页以确保数据完整性。API 可能有返回数量限制，
+        对于活跃账户需要分页查询以获取全部历史。
 
         Args:
             address: 用户地址
             start_time: 起始时间（毫秒时间戳），默认为0（从最早开始）
             end_time: 结束时间（毫秒时间戳），默认为None（到当前时间）
+            use_cache: 是否使用缓存（默认 True）
+            enable_pagination: 是否启用分页（默认 True）
 
         Returns:
             资金费率记录列表
@@ -308,18 +286,151 @@ class HyperliquidAPIClient:
             logger.error(f"无效的地址格式: {address}")
             return []
 
+        # 优化的缓存键：包含时间范围
+        cache_key = f"user_funding:{address}:{start_time}:{end_time}"
+
+        # 缓存检查
+        if use_cache:
+            cached = await self.store.get_api_cache(cache_key)
+            if cached:
+                self.stats['cache_hits'] += 1
+                logger.debug(f"缓存命中: {cache_key}")
+                logger.info(f"使用缓存的资金费率历史: {address} ({len(cached)} 条)")
+                return cached
+
+        # 如果禁用分页，使用单次查询
+        if not enable_pagination:
+            return await self._get_user_funding_single(address, start_time, end_time, use_cache, cache_key)
+
+        # 分页查询主逻辑
+        all_funding = []
+        current_start = start_time
+        page = 0
+
+        logger.info(f"[{address}] 开始获取资金费率历史...")
+
         try:
-            # 使用正确的方法名：user_funding_history（需要提供 startTime 参数）
+            while True:
+                # API 调用
+                async with self.rate_limiter:
+                    async with self.semaphore:
+                        funding = self.info.user_funding_history(address, current_start, end_time)
+
+                # 没有更多数据
+                if not funding:
+                    logger.info(f"[{address}] 资金费率无更多数据，共 {len(all_funding)} 条")
+                    break
+
+                all_funding.extend(funding)
+                page += 1
+                logger.info(f"[{address}] 资金费率第 {page} 页: {len(funding)} 条记录，累计 {len(all_funding)} 条")
+
+                # 判断是否需要继续分页（阈值 2000，与其他 API 一致）
+                if len(funding) < 2000:
+                    logger.info(f"[{address}] 资金费率已到达最后一页，共获取 {len(all_funding)} 条记录")
+                    break
+
+                # 计算下一页起始时间
+                last_time = funding[-1].get('time')
+                if not last_time:
+                    logger.warning(f"[{address}] 无法获取最后一条资金费率记录的时间戳，停止翻页")
+                    break
+
+                # +1 毫秒避免重复
+                current_start = last_time + 1
+
+                # 防止 API 限流
+                await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
+            if not all_funding:
+                return []
+
+        # 去重处理（基于时间和币种）
+        if all_funding:
+            all_funding = self._deduplicate_funding(all_funding)
+            logger.info(f"[{address}] 资金费率去重后: {len(all_funding)} 条记录")
+
+        # 更新缓存
+        if use_cache and all_funding:
+            await self.store.set_api_cache(cache_key, all_funding, self.cache_ttl_hours)
+            logger.debug(f"资金费率缓存已更新: {cache_key}")
+
+        return all_funding
+
+    async def _get_user_funding_single(
+        self,
+        address: str,
+        start_time: int = 0,
+        end_time: Optional[int] = None,
+        use_cache: bool = True,
+        cache_key: Optional[str] = None
+    ) -> List[Dict]:
+        """
+        单次查询版本（保留用于快速降级）
+
+        仅当 enable_pagination=False 时使用
+
+        Args:
+            address: 用户地址
+            start_time: 起始时间戳（毫秒）
+            end_time: 结束时间戳（毫秒）
+            use_cache: 是否使用缓存
+            cache_key: 缓存键（可选）
+
+        Returns:
+            资金费率记录列表
+        """
+        try:
             async with self.rate_limiter:
                 async with self.semaphore:
                     funding = self.info.user_funding_history(address, start_time, end_time)
 
-            logger.info(f"获取资金费率历史: {address} ({len(funding) if funding else 0} 条)")
-            return funding if funding else []
+            logger.info(f"获取资金费率历史（单次查询）: {address} ({len(funding) if funding else 0} 条)")
+
+            result = funding if funding else []
+
+            # 更新缓存
+            if use_cache and result and cache_key:
+                await self.store.set_api_cache(cache_key, result, self.cache_ttl_hours)
+
+            return result
 
         except Exception as e:
             logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
             return []
+
+    def _deduplicate_funding(self, funding: List[Dict]) -> List[Dict]:
+        """
+        去重资金费率记录（基于时间和币种）
+
+        分页查询可能产生重复记录，使用 (time, coin) 确保唯一性
+
+        Args:
+            funding: 原始资金费率列表
+
+        Returns:
+            去重后的资金费率列表（按时间排序）
+        """
+        seen = set()
+        unique_funding = []
+
+        for record in funding:
+            # 构建唯一键：(time, coin)
+            key = (
+                record.get('time'),
+                record.get('coin')
+            )
+
+            if key not in seen:
+                seen.add(key)
+                unique_funding.append(record)
+
+        # 按时间排序（确保数据顺序）
+        unique_funding.sort(key=lambda x: x.get('time', 0))
+
+        return unique_funding
 
     async def get_user_ledger(
         self,

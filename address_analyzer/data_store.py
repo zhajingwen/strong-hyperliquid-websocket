@@ -434,6 +434,12 @@ class DataStore:
         """
         批量保存出入金记录到 transfers 表
 
+        支持类型：
+        - deposit: 充值（正数）
+        - withdraw: 提现（负数）
+        - send: 转账（根据流向判断正负）
+        - subAccountTransfer: 子账户转账（根据流向判断正负）
+
         Args:
             address: 地址
             ledger: 账本变动列表（来自 user_non_funding_ledger_updates）
@@ -448,31 +454,54 @@ class DataStore:
             delta = record.get('delta', {})
             record_type = delta.get('type')
 
-            # 只处理 send 和 subAccountTransfer 类型
-            if record_type not in ['send', 'subAccountTransfer']:
+            # 支持所有出入金类型
+            if record_type not in ['deposit', 'withdraw', 'send', 'subAccountTransfer']:
                 continue
 
             # 提取金额和流向
             amount = 0.0
-            is_incoming = False
+            signed_amount = 0.0
             tx_hash = record.get('hash', '')
 
-            if record_type == 'send':
-                send_data = delta.get('send', {})
-                amount = float(send_data.get('amount', 0))
-                destination = send_data.get('destination', '').lower()
+            if record_type == 'deposit':
+                # 充值：正数
+                amount = float(delta.get('usdc', 0))
+                signed_amount = amount
+
+            elif record_type == 'withdraw':
+                # 提现：负数
+                amount = float(delta.get('usdc', 0))
+                signed_amount = -amount
+
+            elif record_type == 'send':
+                # 转账：根据流向判断
+                amount = float(delta.get('amount', 0))
+                destination = delta.get('destination', '').lower()
                 user = delta.get('user', '').lower()
-                is_incoming = (destination == address.lower())
+                is_incoming = (destination == address.lower() and user != address.lower())
+                is_outgoing = (user == address.lower() and destination != address.lower())
+
+                if is_incoming:
+                    signed_amount = amount
+                elif is_outgoing:
+                    signed_amount = -amount
+                else:
+                    # 自己转给自己，忽略
+                    continue
 
             elif record_type == 'subAccountTransfer':
-                transfer_data = delta.get('subAccountTransfer', {})
-                amount = float(transfer_data.get('usdc', 0))
-                destination = transfer_data.get('destination', '').lower()
+                # 子账户转账：根据流向判断
+                amount = float(delta.get('usdc', 0))
+                destination = delta.get('destination', '').lower()
                 user = delta.get('user', '').lower()
-                is_incoming = (destination == address.lower())
 
-            # 流入为正数，流出为负数
-            signed_amount = amount if is_incoming else -amount
+                if destination == address.lower():
+                    signed_amount = amount
+                elif user == address.lower():
+                    signed_amount = -amount
+                else:
+                    # 不相关，忽略
+                    continue
 
             if amount > 0:
                 # 转换时间戳为 datetime
@@ -488,43 +517,107 @@ class DataStore:
 
         if records_to_insert:
             async with self.pool.acquire() as conn:
+                # 注意：transfers 表的主键是 (id, time)，使用 ON CONFLICT DO UPDATE 更新策略
                 sql = """
                 INSERT INTO transfers (address, time, type, amount, tx_hash)
                 VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (address, time, tx_hash) DO NOTHING
+                ON CONFLICT (id, time) DO UPDATE
+                SET type = EXCLUDED.type,
+                    amount = EXCLUDED.amount,
+                    tx_hash = EXCLUDED.tx_hash
                 """
-                await conn.executemany(sql, records_to_insert)
-                logger.info(f"保存 {len(records_to_insert)} 条出入金记录: {address}")
+                # 由于可能存在重复，先检查是否已存在
+                check_sql = """
+                SELECT COUNT(*) FROM transfers
+                WHERE address = $1 AND time = $2 AND tx_hash = $3
+                """
+
+                inserted_count = 0
+                for record in records_to_insert:
+                    addr, time_dt, rec_type, amount, tx_hash = record
+                    # 检查是否已存在
+                    count = await conn.fetchval(check_sql, addr, time_dt, tx_hash)
+                    if count == 0:
+                        # 不存在，插入
+                        insert_sql = """
+                        INSERT INTO transfers (address, time, type, amount, tx_hash)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """
+                        await conn.execute(insert_sql, addr, time_dt, rec_type, amount, tx_hash)
+                        inserted_count += 1
+
+                logger.info(f"保存 {inserted_count}/{len(records_to_insert)} 条出入金记录: {address}")
 
     async def get_net_deposits(self, address: str) -> Dict[str, float]:
         """
-        计算净充值统计
+        计算净充值统计（区分充值/提现 vs 转账）
 
         Args:
             address: 地址
 
         Returns:
             {
-                'total_deposits': float,      # 总充值（amount > 0）
-                'total_withdrawals': float,   # 总提现（amount < 0）
-                'net_deposits': float         # 净充值（总充值 - 总提现）
+                # 充值/提现（deposit/withdraw）
+                'total_deposits': float,          # 总充值
+                'total_withdrawals': float,       # 总提现
+                'net_deposits': float,            # 净充值 - 传统方法（包含转账）
+
+                # 转账（send/subAccountTransfer）
+                'total_transfers_in': float,      # 转入总额
+                'total_transfers_out': float,     # 转出总额
+                'net_transfers': float,           # 净转账
+
+                # 真实本金（仅充值/提现，不含转账）
+                'true_capital': float             # 真实本金 = 总充值 - 总提现
             }
         """
         sql = """
         SELECT
-            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) as total_deposits,
-            COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) as total_withdrawals,
-            COALESCE(SUM(amount), 0) as net_deposits
+            -- 充值/提现统计
+            COALESCE(SUM(CASE WHEN type = 'deposit' THEN amount ELSE 0 END), 0) as deposit_total,
+            COALESCE(SUM(CASE WHEN type = 'withdraw' THEN ABS(amount) ELSE 0 END), 0) as withdraw_total,
+
+            -- 转账统计
+            COALESCE(SUM(CASE WHEN type IN ('send', 'subAccountTransfer') AND amount > 0 THEN amount ELSE 0 END), 0) as transfer_in_total,
+            COALESCE(SUM(CASE WHEN type IN ('send', 'subAccountTransfer') AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) as transfer_out_total,
+
+            -- 总计（传统方法）
+            COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) as all_in_total,
+            COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) as all_out_total
         FROM transfers
         WHERE address = $1
         """
 
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(sql, address)
+
+            # 充值/提现
+            deposit_total = float(row['deposit_total'])
+            withdraw_total = float(row['withdraw_total'])
+
+            # 转账
+            transfer_in_total = float(row['transfer_in_total'])
+            transfer_out_total = float(row['transfer_out_total'])
+
+            # 总计（传统方法）
+            all_in_total = float(row['all_in_total'])
+            all_out_total = float(row['all_out_total'])
+
             return {
-                'total_deposits': float(row['total_deposits']),
-                'total_withdrawals': float(row['total_withdrawals']),
-                'net_deposits': float(row['net_deposits'])
+                # 充值/提现
+                'total_deposits': deposit_total,
+                'total_withdrawals': withdraw_total,
+
+                # 转账
+                'total_transfers_in': transfer_in_total,
+                'total_transfers_out': transfer_out_total,
+                'net_transfers': transfer_in_total - transfer_out_total,
+
+                # 真实本金（仅充值/提现）
+                'true_capital': deposit_total - withdraw_total,
+
+                # 传统方法（包含转账）
+                'net_deposits': all_in_total - all_out_total
             }
 
     async def get_fills(self, address: str) -> List[Dict]:
@@ -555,6 +648,28 @@ class DataStore:
             address: 地址
             metrics: 指标数据
         """
+        # 数据库字段边界保护
+        def safe_value(key: str, max_val: float, min_val: float = None) -> float:
+            """安全地获取指标值，确保在数据库字段范围内"""
+            value = float(metrics.get(key, 0))
+            if min_val is not None:
+                value = max(min_val, min(max_val, value))
+            else:
+                value = min(max_val, value)
+            return value
+
+        # 应用边界保护
+        safe_metrics = {
+            'total_trades': int(metrics.get('total_trades', 0)),
+            'win_rate': safe_value('win_rate', 100.0, 0.0),  # DECIMAL(6, 2): 0-100
+            'roi': safe_value('roi', 9999999999.99, -9999999999.99),  # DECIMAL(12, 2)
+            'sharpe_ratio': safe_value('sharpe_ratio', 999999.9999, -999999.9999),  # DECIMAL(10, 4)
+            'total_pnl': safe_value('total_pnl', 999999999999.99999999, -999999999999.99999999),  # DECIMAL(20, 8)
+            'account_value': safe_value('account_value', 999999999999.99999999, 0.0),  # DECIMAL(20, 8)
+            'max_drawdown': safe_value('max_drawdown', 999999.99, 0.0),  # DECIMAL(8, 2)
+            'net_deposit': safe_value('net_deposit', 999999999999.99999999, -999999999999.99999999)  # DECIMAL(20, 8)
+        }
+
         sql = """
         INSERT INTO metrics_cache (
             address, total_trades, win_rate, roi, sharpe_ratio,
@@ -576,14 +691,14 @@ class DataStore:
             await conn.execute(
                 sql,
                 address,
-                metrics.get('total_trades', 0),
-                metrics.get('win_rate', 0),
-                metrics.get('roi', 0),
-                metrics.get('sharpe_ratio', 0),
-                metrics.get('total_pnl', 0),
-                metrics.get('account_value', 0),
-                metrics.get('max_drawdown', 0),
-                metrics.get('net_deposit', 0)
+                safe_metrics['total_trades'],
+                safe_metrics['win_rate'],
+                safe_metrics['roi'],
+                safe_metrics['sharpe_ratio'],
+                safe_metrics['total_pnl'],
+                safe_metrics['account_value'],
+                safe_metrics['max_drawdown'],
+                safe_metrics['net_deposit']
             )
 
     async def get_all_metrics(self) -> List[Dict]:

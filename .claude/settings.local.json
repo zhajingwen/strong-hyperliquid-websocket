@@ -18,7 +18,14 @@
       "Bash(ls:*)",
       "Bash(uv run python:*)",
       "Bash(psql:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(source venv/bin/activate:*)",
+      "Bash(source strong-hyperliquid-websocket/bin/activate:*)",
+      "Bash(source:*)",
+      "WebSearch",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(find:*)"
     ]
   }
 }
