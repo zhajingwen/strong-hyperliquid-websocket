@@ -4,7 +4,6 @@ Hyperliquid API 客户端 - 封装 API 调用，处理并发、限流、缓存
 import time
 import asyncio
 import logging
-import re
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import aiohttp
@@ -12,11 +11,9 @@ from aiolimiter import AsyncLimiter
 from hyperliquid.info import Info
 
 from .data_store import DataStore
+from .utils import validate_eth_address, deduplicate_records
 
 logger = logging.getLogger(__name__)
-
-# 标准以太坊地址格式：0x + 40个十六进制字符
-ETH_ADDRESS_PATTERN = re.compile(r'^0x[a-fA-F0-9]{40}$', re.IGNORECASE)
 
 
 class HyperliquidAPIClient:
@@ -110,20 +107,6 @@ class HyperliquidAPIClient:
                     logger.error(f"API 请求最终失败: {url}")
                     return None
 
-    def _validate_address(self, address: str) -> bool:
-        """
-        验证以太坊地址格式
-
-        Args:
-            address: 地址字符串
-
-        Returns:
-            是否有效
-        """
-        if not address or not isinstance(address, str):
-            return False
-        return bool(ETH_ADDRESS_PATTERN.match(address))
-
     async def get_user_fills(
         self,
         address: str,
@@ -149,9 +132,14 @@ class HyperliquidAPIClient:
         """
         try:
             # 验证地址格式
-            if not self._validate_address(address):
+            if not validate_eth_address(address):
                 logger.error(f"无效的地址格式: {address}")
                 return []
+
+            # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
+            if await self.store.is_data_fresh(address, 'fills', self.cache_ttl_hours):
+                logger.info(f"[{address}] fills 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
+                return await self.store.get_fills(address)
 
             # 增量更新：查询数据库最新时间
             if incremental:
@@ -298,9 +286,14 @@ class HyperliquidAPIClient:
             账户状态数据
         """
         # 验证地址格式
-        if not self._validate_address(address):
+        if not validate_eth_address(address):
             logger.error(f"无效的地址格式: {address}")
             return None
+
+        # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
+        if await self.store.is_data_fresh(address, 'user_state', self.cache_ttl_hours):
+            logger.info(f"[{address}] user_state 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
+            return await self.store.get_latest_user_state(address)
 
         cache_key = f"user_state:{address}"
 
@@ -349,9 +342,14 @@ class HyperliquidAPIClient:
             Spot 账户状态数据，包含 balances 字段
         """
         # 验证地址格式
-        if not self._validate_address(address):
+        if not validate_eth_address(address):
             logger.error(f"无效的地址格式: {address}")
             return None
+
+        # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
+        if await self.store.is_data_fresh(address, 'spot_state', self.cache_ttl_hours):
+            logger.info(f"[{address}] spot_state 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
+            return await self.store.get_latest_spot_state(address)
 
         cache_key = f"spot_state:{address}"
 
@@ -414,9 +412,14 @@ class HyperliquidAPIClient:
             资金费率记录列表
         """
         # 验证地址格式
-        if not self._validate_address(address):
+        if not validate_eth_address(address):
             logger.error(f"无效的地址格式: {address}")
             return []
+
+        # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
+        if await self.store.is_data_fresh(address, 'funding', self.cache_ttl_hours):
+            logger.info(f"[{address}] funding 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
+            return await self.store.get_funding_history(address)
 
         # 增量更新：查询数据库最新时间
         if incremental and start_time == 0:
@@ -491,7 +494,10 @@ class HyperliquidAPIClient:
 
         # 去重处理（基于时间和币种）
         if all_funding:
-            all_funding = self._deduplicate_funding(all_funding)
+            all_funding = deduplicate_records(
+                all_funding,
+                lambda r: (r.get('time'), r.get('coin'))
+            )
             logger.info(f"[{address}] 资金费率去重后: {len(all_funding)} 条记录")
 
         # 更新缓存
@@ -551,44 +557,14 @@ class HyperliquidAPIClient:
             logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
             return []
 
-    def _deduplicate_funding(self, funding: List[Dict]) -> List[Dict]:
-        """
-        去重资金费率记录（基于时间和币种）
-
-        分页查询可能产生重复记录，使用 (time, coin) 确保唯一性
-
-        Args:
-            funding: 原始资金费率列表
-
-        Returns:
-            去重后的资金费率列表（按时间排序）
-        """
-        seen = set()
-        unique_funding = []
-
-        for record in funding:
-            # 构建唯一键：(time, coin)
-            key = (
-                record.get('time'),
-                record.get('coin')
-            )
-
-            if key not in seen:
-                seen.add(key)
-                unique_funding.append(record)
-
-        # 按时间排序（确保数据顺序）
-        unique_funding.sort(key=lambda x: x.get('time', 0))
-
-        return unique_funding
-
     async def get_user_ledger(
         self,
         address: str,
         start_time: int = 0,
         end_time: Optional[int] = None,
         use_cache: bool = True,
-        enable_pagination: bool = True
+        enable_pagination: bool = True,
+        incremental: bool = True
     ) -> List[Dict]:
         """
         获取用户出入金记录（非资金费用的账本变动）
@@ -602,10 +578,25 @@ class HyperliquidAPIClient:
             end_time: 结束时间戳（毫秒）
             use_cache: 是否使用缓存
             enable_pagination: 是否启用分页（默认 True）
+            incremental: 是否启用增量更新（默认 True）
 
         Returns:
             账本变动列表，包含 send 和 subAccountTransfer 类型
         """
+        # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
+        if await self.store.is_data_fresh(address, 'transfers', self.cache_ttl_hours):
+            logger.info(f"[{address}] transfers 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
+            return await self.store.get_transfers(address)
+
+        # 增量更新：查询数据库最新时间
+        if incremental and start_time == 0:
+            latest_time = await self.store.get_latest_transfer_time(address)
+            if latest_time:
+                start_time = latest_time + 1
+                logger.info(f"[{address}] 出入金增量更新: 从 {start_time} ({datetime.fromtimestamp(start_time/1000)}) 开始")
+            else:
+                logger.info(f"[{address}] 出入金首次获取: 从 0 开始")
+
         # 优化的缓存键：包含时间范围
         cache_key = f"user_ledger:{address}:{start_time}:{end_time}"
 
@@ -667,14 +658,26 @@ class HyperliquidAPIClient:
             if not all_ledger:
                 return []
 
-        # 去重处理
+        # 去重处理（基于三元组：时间、哈希、类型）
         if all_ledger:
-            all_ledger = self._deduplicate_ledger(all_ledger)
+            all_ledger = deduplicate_records(
+                all_ledger,
+                lambda r: (
+                    r.get('time'),
+                    r.get('hash'),
+                    r.get('delta', {}).get('type') if isinstance(r.get('delta'), dict) else None
+                )
+            )
             logger.info(f"[{address}] 去重后: {len(all_ledger)} 条记录")
 
         # 更新缓存
         if use_cache and all_ledger:
             await self.store.set_api_cache(cache_key, all_ledger, self.cache_ttl_hours)
+
+        # 增量模式：保存到数据库
+        if incremental and all_ledger:
+            await self.store.save_transfers(address, all_ledger)
+            logger.info(f"[{address}] 出入金增量数据已保存: {len(all_ledger)} 条新记录")
 
         return all_ledger
 
@@ -710,39 +713,6 @@ class HyperliquidAPIClient:
         except Exception as e:
             logger.warning(f"获取 user_non_funding_ledger_updates 失败: {address} - {e}")
             return []
-
-    def _deduplicate_ledger(self, ledger: List[Dict]) -> List[Dict]:
-        """
-        去重账本记录（基于三元组：时间、哈希、类型）
-
-        分页查询可能产生重复记录，使用三元组确保唯一性
-
-        Args:
-            ledger: 原始账本列表
-
-        Returns:
-            去重后的账本列表（按时间排序）
-        """
-        seen = set()
-        unique_ledger = []
-
-        for record in ledger:
-            # 构建唯一键：(time, hash, delta.type)
-            delta_type = record.get('delta', {}).get('type') if isinstance(record.get('delta'), dict) else None
-            key = (
-                record.get('time'),
-                record.get('hash'),
-                delta_type
-            )
-
-            if key not in seen:
-                seen.add(key)
-                unique_ledger.append(record)
-
-        # 按时间排序（确保数据顺序）
-        unique_ledger.sort(key=lambda x: x.get('time', 0))
-
-        return unique_ledger
 
     def _classify_ledger_data(self, ledger: List[Dict], target_address: str) -> Dict[str, Any]:
         """
@@ -840,8 +810,8 @@ class HyperliquidAPIClient:
         fills_task = self.get_user_fills(address, incremental=incremental)
         state_task = self.get_user_state(address)
         spot_state_task = self.get_spot_state(address)
-        funding_task = self.get_user_funding(address)
-        ledger_task = self.get_user_ledger(address)
+        funding_task = self.get_user_funding(address, incremental=incremental)
+        ledger_task = self.get_user_ledger(address, incremental=incremental)
 
         fills, state, spot_state, funding, ledger = await asyncio.gather(
             fills_task,
@@ -909,11 +879,11 @@ class HyperliquidAPIClient:
             ledger = []
 
         # 保存到数据库
-        # 注意：增量模式的 fills 已在 get_user_fills 中保存，这里只保存全量模式
+        # 注意：增量模式的 fills 和 ledger 已在各自方法中保存，这里只保存全量模式
         if save_to_db and not incremental and fills:
             await self.store.save_fills(address, fills)
 
-        if save_to_db and ledger:
+        if save_to_db and not incremental and ledger:
             await self.store.save_transfers(address, ledger)
 
         return {

@@ -714,6 +714,95 @@ class DataStore:
                 return int(row['latest_time_ms'])
             return None
 
+    async def is_data_fresh(self, address: str, data_type: str, ttl_hours: int = 24) -> bool:
+        """
+        检查指定数据类型是否在 TTL 内（数据新鲜度检查）
+
+        Args:
+            address: 用户地址
+            data_type: 数据类型 ('fills', 'user_state', 'spot_state', 'funding', 'transfers')
+            ttl_hours: 数据有效期（小时），默认24小时
+
+        Returns:
+            True 表示数据新鲜（在TTL内），False 表示数据过期或不存在
+        """
+        # 根据数据类型选择对应的表和时间字段
+        table_config = {
+            'fills': ('fills', 'time'),
+            'user_state': ('user_states', 'snapshot_time'),
+            'spot_state': ('spot_states', 'snapshot_time'),
+            'funding': ('funding_history', 'time'),
+            'transfers': ('transfers', 'time'),
+        }
+
+        if data_type not in table_config:
+            logger.warning(f"未知的数据类型: {data_type}")
+            return False
+
+        table_name, time_column = table_config[data_type]
+
+        sql = f"""
+        SELECT MAX({time_column}) AS latest_time
+        FROM {table_name}
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if not row or not row['latest_time']:
+                return False
+
+            latest_time = row['latest_time']
+            # 计算时间差
+            now = datetime.now(timezone.utc)
+            age = now - latest_time.replace(tzinfo=timezone.utc)
+            is_fresh = age.total_seconds() < ttl_hours * 3600
+
+            logger.debug(f"[{address}] {data_type} 数据新鲜度检查: 最新时间={latest_time}, 年龄={age}, 新鲜={is_fresh}")
+            return is_fresh
+
+    async def get_latest_transfer_time(self, address: str) -> Optional[int]:
+        """
+        获取地址最新的出入金时间戳（用于增量更新）
+
+        Args:
+            address: 用户地址
+
+        Returns:
+            最新出入金的时间戳（毫秒），如果没有记录返回None
+        """
+        sql = """
+        SELECT EXTRACT(EPOCH FROM MAX(time)) * 1000 AS latest_time_ms
+        FROM transfers
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if row and row['latest_time_ms']:
+                return int(row['latest_time_ms'])
+            return None
+
+    async def get_transfers(self, address: str) -> List[Dict]:
+        """
+        获取地址的所有出入金记录
+
+        Args:
+            address: 地址
+
+        Returns:
+            出入金记录列表
+        """
+        sql = """
+        SELECT * FROM transfers
+        WHERE address = $1
+        ORDER BY time ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, address)
+            return [dict(row) for row in rows]
+
     async def save_user_state(self, address: str, state: Dict):
         """
         保存用户 Perp 账户状态快照
