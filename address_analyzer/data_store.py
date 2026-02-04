@@ -176,6 +176,14 @@ class DataStore:
             PRIMARY KEY (time, address, coin)
         );
 
+        -- 11. 数据新鲜度跟踪表
+        CREATE TABLE IF NOT EXISTS data_freshness (
+            address VARCHAR(42) NOT NULL,
+            data_type VARCHAR(20) NOT NULL,  -- 'fills', 'user_state', 'spot_state', 'funding', 'transfers'
+            last_fetched TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (address, data_type)
+        );
+
         -- 索引优化
         CREATE INDEX IF NOT EXISTS idx_fills_address_time ON fills(address, time DESC);
         CREATE INDEX IF NOT EXISTS idx_transfers_address_time ON transfers(address, time DESC);
@@ -184,6 +192,7 @@ class DataStore:
         CREATE INDEX IF NOT EXISTS idx_user_states_address_time ON user_states(address, snapshot_time DESC);
         CREATE INDEX IF NOT EXISTS idx_spot_states_address_time ON spot_states(address, snapshot_time DESC);
         CREATE INDEX IF NOT EXISTS idx_funding_history_address_time ON funding_history(address, time DESC);
+        CREATE INDEX IF NOT EXISTS idx_data_freshness_time ON data_freshness(data_type, last_fetched);
         """
 
         # TimescaleDB hypertable 转换（需要单独执行）
@@ -718,6 +727,9 @@ class DataStore:
         """
         检查指定数据类型是否在 TTL 内（数据新鲜度检查）
 
+        基于 data_freshness 表的 last_fetched 时间判断，而非数据记录本身的时间。
+        这样可以避免不活跃用户（无新交易）每次都被判断为"不新鲜"而触发无效 API 调用。
+
         Args:
             address: 用户地址
             data_type: 数据类型 ('fills', 'user_state', 'spot_state', 'funding', 'transfers')
@@ -726,40 +738,51 @@ class DataStore:
         Returns:
             True 表示数据新鲜（在TTL内），False 表示数据过期或不存在
         """
-        # 根据数据类型选择对应的表和时间字段
-        table_config = {
-            'fills': ('fills', 'time'),
-            'user_state': ('user_states', 'snapshot_time'),
-            'spot_state': ('spot_states', 'snapshot_time'),
-            'funding': ('funding_history', 'time'),
-            'transfers': ('transfers', 'time'),
-        }
-
-        if data_type not in table_config:
+        valid_types = {'fills', 'user_state', 'spot_state', 'funding', 'transfers'}
+        if data_type not in valid_types:
             logger.warning(f"未知的数据类型: {data_type}")
             return False
 
-        table_name, time_column = table_config[data_type]
-
-        sql = f"""
-        SELECT MAX({time_column}) AS latest_time
-        FROM {table_name}
-        WHERE address = $1
+        sql = """
+        SELECT last_fetched FROM data_freshness
+        WHERE address = $1 AND data_type = $2
         """
 
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(sql, address)
-            if not row or not row['latest_time']:
+            row = await conn.fetchrow(sql, address, data_type)
+            if not row or not row['last_fetched']:
+                logger.debug(f"[{address}] {data_type} 无获取记录，数据不新鲜")
                 return False
 
-            latest_time = row['latest_time']
+            last_fetched = row['last_fetched']
             # 计算时间差
             now = datetime.now(timezone.utc)
-            age = now - latest_time.replace(tzinfo=timezone.utc)
+            age = now - last_fetched.replace(tzinfo=timezone.utc)
             is_fresh = age.total_seconds() < ttl_hours * 3600
 
-            logger.debug(f"[{address}] {data_type} 数据新鲜度检查: 最新时间={latest_time}, 年龄={age}, 新鲜={is_fresh}")
+            logger.debug(f"[{address}] {data_type} 新鲜度检查: 上次获取={last_fetched}, 年龄={age}, 新鲜={is_fresh}")
             return is_fresh
+
+    async def update_data_freshness(self, address: str, data_type: str):
+        """
+        记录数据获取时间（用于新鲜度检查）
+
+        在成功从 API 获取数据后调用此方法，更新 last_fetched 时间戳。
+
+        Args:
+            address: 用户地址
+            data_type: 数据类型 ('fills', 'user_state', 'spot_state', 'funding', 'transfers')
+        """
+        sql = """
+        INSERT INTO data_freshness (address, data_type, last_fetched)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (address, data_type)
+        DO UPDATE SET last_fetched = NOW()
+        """
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(sql, address, data_type)
+            logger.debug(f"[{address}] 更新 {data_type} 新鲜度标记")
 
     async def get_latest_transfer_time(self, address: str) -> Optional[int]:
         """

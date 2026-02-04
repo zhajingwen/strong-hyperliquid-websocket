@@ -22,6 +22,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from aiolimiter import AsyncLimiter
+from retry import retry
 
 logger = logging.getLogger(__name__)
 
@@ -104,17 +105,16 @@ class HyperliquidHTTPClient:
                 f"失败={self.stats['failed_requests']}"
             )
 
+    @retry(exceptions=(aiohttp.ClientError, asyncio.TimeoutError), tries=3, delay=1, backoff=2, logger=logger)
     async def _request(
         self,
-        payload: Dict[str, Any],
-        retry_count: int = 3
+        payload: Dict[str, Any]
     ) -> Optional[Dict]:
         """
-        发送HTTP请求到Hyperliquid API
+        发送HTTP请求到Hyperliquid API（带自动重试）
 
         Args:
             payload: 请求体
-            retry_count: 重试次数
 
         Returns:
             API响应数据，或None表示失败
@@ -126,60 +126,36 @@ class HyperliquidHTTPClient:
         # 应用限流和并发控制
         async with self.rate_limiter:
             async with self.semaphore:
-                for attempt in range(retry_count):
-                    try:
-                        # 发送请求
-                        async with self.session.post(
-                            self.BASE_URL,
-                            json=payload,
-                            ssl=self.ssl
-                        ) as resp:
-                            self.stats['total_requests'] += 1
+                async with self.session.post(
+                    self.BASE_URL,
+                    json=payload,
+                    ssl=self.ssl
+                ) as resp:
+                    self.stats['total_requests'] += 1
 
-                            if resp.status == 200:
-                                self.stats['successful_requests'] += 1
-                                data = await resp.json()
-                                return data
+                    if resp.status == 200:
+                        self.stats['successful_requests'] += 1
+                        data = await resp.json()
+                        return data
 
-                            elif resp.status == 429:
-                                # 限流，等待后重试
-                                wait_time = 2 ** attempt
-                                logger.warning(
-                                    f"API限流 (429)，等待{wait_time}秒后重试... "
-                                    f"(尝试 {attempt + 1}/{retry_count})"
-                                )
-                                await asyncio.sleep(wait_time)
-
-                            else:
-                                # 其他错误
-                                error_msg = await resp.text()
-                                logger.error(
-                                    f"API错误 {resp.status}: {error_msg[:200]}"
-                                )
-                                self.stats['failed_requests'] += 1
-                                return None
-
-                    except asyncio.TimeoutError:
+                    elif resp.status == 429:
+                        # 限流，抛出异常触发重试
                         self.stats['failed_requests'] += 1
-                        logger.warning(
-                            f"请求超时: {payload.get('type', 'unknown')} "
-                            f"(尝试 {attempt + 1}/{retry_count})"
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=429,
+                            message="Rate limited"
                         )
-                        if attempt < retry_count - 1:
-                            await asyncio.sleep(2 ** attempt)
 
-                    except Exception as e:
-                        self.stats['failed_requests'] += 1
+                    else:
+                        # 其他错误
+                        error_msg = await resp.text()
                         logger.error(
-                            f"请求异常: {type(e).__name__}: {str(e)[:200]}"
+                            f"API错误 {resp.status}: {error_msg[:200]}"
                         )
+                        self.stats['failed_requests'] += 1
                         return None
-
-                logger.error(
-                    f"请求失败 (重试{retry_count}次后放弃): "
-                    f"{payload.get('type', 'unknown')}"
-                )
-                return None
 
     async def get_user_state(self, address: str) -> Optional[Dict]:
         """

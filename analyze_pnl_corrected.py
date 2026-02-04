@@ -291,7 +291,7 @@ if __name__ == '__main__':
     import sys
 
     # 默认测试地址
-    default_address = "0xde786a32f80731923d6297c14ef43ca1c8fd4b44"
+    default_address = "0x324f74880ccee9a05282614d3f80c09831a36774"
 
     if len(sys.argv) > 1:
         address = sys.argv[1]

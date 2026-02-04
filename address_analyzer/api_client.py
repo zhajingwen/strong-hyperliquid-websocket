@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any
 import aiohttp
 from aiolimiter import AsyncLimiter
 from hyperliquid.info import Info
+from retry import retry
 
 from .data_store import DataStore
 from .utils import validate_eth_address, deduplicate_records
@@ -62,12 +63,12 @@ class HyperliquidAPIClient:
             'api_errors': 0
         }
 
+    @retry(exceptions=(aiohttp.ClientError, asyncio.TimeoutError), tries=3, delay=1, backoff=2, logger=logger)
     async def _make_request(
         self,
         method: str,
         endpoint: str,
-        params: Optional[Dict] = None,
-        retry_count: int = 3
+        params: Optional[Dict] = None
     ) -> Optional[Dict]:
         """
         内部方法：发送 HTTP 请求（带重试）
@@ -76,36 +77,22 @@ class HyperliquidAPIClient:
             method: HTTP 方法
             endpoint: API 端点
             params: 请求参数
-            retry_count: 重试次数
 
         Returns:
             响应数据或None
         """
         url = f"{self.BASE_URL}/{endpoint}"
 
-        for attempt in range(retry_count):
-            try:
-                # 速率限制
-                async with self.rate_limiter:
-                    # 并发控制
-                    async with self.semaphore:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.request(method, url, json=params) as resp:
-                                resp.raise_for_status()
-                                data = await resp.json()
-                                self.stats['total_requests'] += 1
-                                return data
-
-            except aiohttp.ClientError as e:
-                self.stats['api_errors'] += 1
-                logger.warning(f"API 请求失败 (尝试 {attempt + 1}/{retry_count}): {e}")
-
-                if attempt < retry_count - 1:
-                    # 指数退避
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error(f"API 请求最终失败: {url}")
-                    return None
+        # 速率限制
+        async with self.rate_limiter:
+            # 并发控制
+            async with self.semaphore:
+                async with aiohttp.ClientSession() as session:
+                    async with session.request(method, url, json=params) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                        self.stats['total_requests'] += 1
+                        return data
 
     async def get_user_fills(
         self,
@@ -259,6 +246,9 @@ class HyperliquidAPIClient:
             if use_cache and not incremental and all_fills:
                 await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
 
+            # 更新数据新鲜度标记（无论是否有新数据，API 调用成功即更新）
+            await self.store.update_data_freshness(address, 'fills')
+
             return all_fills
 
         except Exception as e:
@@ -320,6 +310,9 @@ class HyperliquidAPIClient:
             if state:
                 await self.store.save_user_state(address, state)
 
+            # 更新数据新鲜度标记
+            await self.store.update_data_freshness(address, 'user_state')
+
             return state
 
         except Exception as e:
@@ -378,6 +371,9 @@ class HyperliquidAPIClient:
             # 持久化到数据库
             if spot_state:
                 await self.store.save_spot_state(address, spot_state)
+
+            # 更新数据新鲜度标记
+            await self.store.update_data_freshness(address, 'spot_state')
 
             return spot_state
 
@@ -508,6 +504,9 @@ class HyperliquidAPIClient:
         # 持久化到数据库
         if all_funding:
             await self.store.save_funding_history(address, all_funding)
+
+        # 更新数据新鲜度标记（无论是否有新数据，API 调用成功即更新）
+        await self.store.update_data_freshness(address, 'funding')
 
         return all_funding
 
@@ -678,6 +677,9 @@ class HyperliquidAPIClient:
         if incremental and all_ledger:
             await self.store.save_transfers(address, all_ledger)
             logger.info(f"[{address}] 出入金增量数据已保存: {len(all_ledger)} 条新记录")
+
+        # 更新数据新鲜度标记（无论是否有新数据，API 调用成功即更新）
+        await self.store.update_data_freshness(address, 'transfers')
 
         return all_ledger
 
