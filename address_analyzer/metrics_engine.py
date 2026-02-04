@@ -17,7 +17,6 @@ class AddressMetrics:
     address: str
     total_trades: int
     win_rate: float          # 胜率 (%)
-    roi: float               # 收益率 (%) - 旧版推算初始资金
     sharpe_ratio: float      # 夏普比率
     total_pnl: float         # 总PNL = 已实现PNL (USD)
     account_value: float     # 账户价值 (USD) - Perp + Spot 总和
@@ -28,16 +27,11 @@ class AddressMetrics:
     last_trade_time: int     # 最后交易时间
     active_days: int         # 活跃天数
 
-    # 账户价值分解（新增）
-    perp_value: float = 0.0  # Perp 账户价值 (USD)
-    spot_value: float = 0.0  # Spot 账户价值 (USD)
 
     # 出入金相关字段
-    net_deposits: float = 0.0           # 净充值 (USD) - 仅 deposit/withdraw
     total_deposits: float = 0.0         # 总充值 (USD)
     total_withdrawals: float = 0.0      # 总提现 (USD)
     actual_initial_capital: float = 0.0 # 实际初始资金 (USD) - 传统方法
-    corrected_roi: float = 0.0          # 校准后的ROI (%) - 传统方法
 
     # 转账相关字段（区分盈亏转移）
     total_transfers_in: float = 0.0     # 转入总额 (send/subAccountTransfer)
@@ -68,8 +62,6 @@ class AddressMetrics:
 
     # 累计收益率指标（新增）
     initial_capital_corrected: float = 0.0 # 校正后的账户初始值（含外部转入）
-    cumulative_return: float = 0.0         # 累计收益率（%）
-    annualized_return: float = 0.0         # 年化收益率（%）复利计算
 
     # Sharpe比率扩展指标（P2优化新增）
     sharpe_quality: str = "estimated"      # Sharpe质量：enhanced|standard|estimated|estimated_fallback
@@ -152,6 +144,167 @@ class MetricsEngine:
         else:
             logger.debug("检测到未排序数据，执行排序")
             return sorted(fills, key=lambda x: x.get('time', 0))
+
+    @classmethod
+    def _collect_metrics_data(
+        cls,
+        fills: List[Dict],
+        ledger: Optional[List[Dict]] = None,
+        address: Optional[str] = None
+    ) -> Dict:
+        """
+        单次遍历收集所有指标计算所需的数据
+
+        性能优化：将原来的 16+ 次遍历合并为 1 次
+        复杂度：O(N) + O(N log N) 排序（如需要）
+
+        Args:
+            fills: 交易记录列表
+            ledger: 出入金记录（可选）
+            address: 用户地址（使用 ledger 时需要）
+
+        Returns:
+            包含所有预计算数据的字典
+        """
+        if not fills:
+            return {
+                'total_trades': 0,
+                'realized_pnl': 0.0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'zero_pnl_trades': 0,
+                'total_volume': 0.0,
+                'avg_trade_size': 0.0,
+                'first_trade_time': 0,
+                'last_trade_time': 0,
+                'trading_dates': set(),
+                'active_days': 0,
+                'pnl_sequence': [],
+                'time_sequence': [],
+                'events': [],
+                'sorted_fills': [],
+                'is_sorted': True,
+                'total_wins': 0.0,
+                'total_losses': 0.0
+            }
+
+        # 初始化计数器和累加器
+        realized_pnl = 0.0
+        winning_trades = 0
+        losing_trades = 0
+        zero_pnl_trades = 0
+        total_volume = 0.0
+        total_wins = 0.0
+        total_losses = 0.0
+        trading_dates = set()
+        pnl_sequence = []
+        time_sequence = []
+        events = []
+
+        # 排序检测
+        is_sorted = True
+        prev_time = -float('inf')
+
+        # === 单次遍历 ===
+        for fill in fills:
+            pnl = cls._get_pnl(fill)
+            time_val = fill.get('time', 0)
+
+            # 1. PNL 统计
+            realized_pnl += pnl
+            if pnl > 0:
+                winning_trades += 1
+                total_wins += pnl
+            elif pnl < 0:
+                losing_trades += 1
+                total_losses += abs(pnl)
+            else:
+                zero_pnl_trades += 1
+
+            # 2. 交易量
+            price = float(fill.get('px', 0))
+            size = float(fill.get('sz', 0))
+            total_volume += price * size
+
+            # 3. 排序检测
+            # 处理 datetime 和毫秒时间戳两种格式
+            if isinstance(time_val, datetime):
+                time_comparable = time_val.timestamp() * 1000
+            else:
+                time_comparable = time_val
+
+            if time_comparable < prev_time:
+                is_sorted = False
+            prev_time = time_comparable
+
+            # 4. 活跃天数
+            if isinstance(time_val, datetime):
+                trading_dates.add(time_val.date())
+            elif isinstance(time_val, int) and time_val > 0:
+                trading_dates.add(datetime.fromtimestamp(time_val / 1000).date())
+
+            # 5. 序列数据
+            pnl_sequence.append(pnl)
+            time_sequence.append(time_val)
+
+            # 6. Events 构建（用于 Sharpe、回撤等计算）
+            events.append({
+                'time': time_val,
+                'type': 'trade',
+                'pnl': pnl
+            })
+
+        # 添加出入金事件
+        if ledger and address:
+            for record in ledger:
+                amount = cls._extract_ledger_amount(record, address)
+                if amount != 0:
+                    events.append({
+                        'time': record.get('time', 0),
+                        'type': 'cash_flow',
+                        'amount': amount
+                    })
+
+        # 排序处理
+        if not is_sorted:
+            sorted_fills = sorted(fills, key=lambda x: x.get('time', 0))
+            # 重建序列数据
+            pnl_sequence = [cls._get_pnl(f) for f in sorted_fills]
+            time_sequence = [f.get('time', 0) for f in sorted_fills]
+            logger.debug("检测到未排序数据，已执行排序")
+        else:
+            sorted_fills = fills
+
+        # 对 events 排序
+        events.sort(key=lambda x: x['time'] if not isinstance(x['time'], datetime)
+                    else x['time'].timestamp() * 1000)
+
+        # 计算派生指标
+        total_trades = len(fills)
+        avg_trade_size = total_volume / total_trades if total_trades > 0 else 0.0
+        first_trade_time = time_sequence[0] if time_sequence else 0
+        last_trade_time = time_sequence[-1] if time_sequence else 0
+
+        return {
+            'total_trades': total_trades,
+            'realized_pnl': realized_pnl,
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'zero_pnl_trades': zero_pnl_trades,
+            'total_volume': total_volume,
+            'avg_trade_size': avg_trade_size,
+            'first_trade_time': first_trade_time,
+            'last_trade_time': last_trade_time,
+            'trading_dates': trading_dates,
+            'active_days': len(trading_dates),
+            'pnl_sequence': pnl_sequence,
+            'time_sequence': time_sequence,
+            'events': events,
+            'sorted_fills': sorted_fills,
+            'is_sorted': is_sorted,
+            'total_wins': total_wins,
+            'total_losses': total_losses
+        }
 
     @staticmethod
     def calculate_win_rate(fills: List[Dict]) -> float:
@@ -252,41 +405,17 @@ class MetricsEngine:
         return actual_initial
 
     @staticmethod
-    def calculate_corrected_roi(realized_pnl: float, actual_initial_capital: float) -> float:
-        """
-        计算校准后的ROI
-
-        公式：校准ROI = (已实现PNL / 实际初始资金) × 100
-
-        Args:
-            realized_pnl: 已实现PNL
-            actual_initial_capital: 实际初始资金
-
-        Returns:
-            校准后的ROI (%)
-        """
-        if actual_initial_capital <= 0:
-            return 0.0
-
-        corrected_roi = (realized_pnl / actual_initial_capital) * 100
-
-        # 边界保护
-        return max(-999999.99, min(999999.99, corrected_roi))
-
-    @staticmethod
     def calculate_pnl_and_roi(
         fills: List[Dict],
         account_value: float,
         net_deposits: float = 0.0,
         has_transfer_data: bool = False,
         true_capital: Optional[float] = None
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, float, float]:
         """
-        计算总PNL和ROI（扩展版返回5个值，支持两种本金口径）
+        计算总PNL和真实本金ROI
 
         总PNL = 所有交易的已实现PNL之和 (sum of closedPnl)
-        Legacy ROI = (已实现PNL / 推算初始资金) * 100
-        Corrected ROI = (已实现PNL / 实际初始资金) * 100 - 传统方法（含转账）
         True Capital ROI = (已实现PNL / 真实本金) * 100 - 保守方法（仅充值/提现）
 
         Args:
@@ -297,46 +426,48 @@ class MetricsEngine:
             true_capital: 真实本金（仅充值/提现，不含转账）
 
         Returns:
-            (total_pnl, legacy_roi, actual_initial_capital, corrected_roi, true_capital_roi)
+            (total_pnl, actual_initial_capital, true_capital_roi)
         """
         if not fills:
-            return 0.0, 0.0, 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         # 计算已实现PNL（所有交易的closedPnl总和）
         realized_pnl = sum(MetricsEngine._get_pnl(fill) for fill in fills)
         total_pnl = realized_pnl
 
-        # 计算旧版ROI：基于推算的初始资金
+        # 计算推算的初始资金（用于降级策略）
         estimated_initial = account_value - realized_pnl
-        if estimated_initial > 0:
-            legacy_roi = (realized_pnl / estimated_initial) * 100
-        else:
-            legacy_roi = 0.0
 
-        # 边界保护
-        legacy_roi = max(-999999.99, min(999999.99, legacy_roi))
-
-        # 如果有出入金数据，计算真实初始资金和校准ROI
+        # 如果有出入金数据，计算真实初始资金
         if has_transfer_data:
             # 传统方法：包含转账的初始资金
             actual_initial = MetricsEngine.calculate_actual_initial_capital(
                 account_value, realized_pnl, net_deposits
             )
-            corrected_roi = MetricsEngine.calculate_corrected_roi(realized_pnl, actual_initial)
 
             # 保守方法：基于真实本金（仅充值/提现）
             if true_capital is not None and true_capital > 0:
-                true_capital_roi = MetricsEngine.calculate_corrected_roi(realized_pnl, true_capital)
+                # 计算真实本金ROI
+                true_capital_roi = (realized_pnl / true_capital) * 100
+                # 边界保护
+                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
             else:
-                # 如果没有真实本金数据，使用传统方法
-                true_capital_roi = corrected_roi
+                # 如果没有真实本金数据，使用实际初始资金
+                if actual_initial > 0:
+                    true_capital_roi = (realized_pnl / actual_initial) * 100
+                    true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
+                else:
+                    true_capital_roi = 0.0
         else:
-            # 降级策略
+            # 降级策略：使用推算的初始资金
             actual_initial = estimated_initial
-            corrected_roi = legacy_roi
-            true_capital_roi = legacy_roi
+            if estimated_initial > 0:
+                true_capital_roi = (realized_pnl / estimated_initial) * 100
+                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
+            else:
+                true_capital_roi = 0.0
 
-        return total_pnl, legacy_roi, actual_initial, corrected_roi, true_capital_roi
+        return total_pnl, actual_initial, true_capital_roi
 
     @classmethod
     def calculate_time_weighted_roi(
@@ -455,7 +586,57 @@ class MetricsEngine:
 
             if initial_capital_total > 0:
                 total_return_rate = account_value / initial_capital_total
-                annualized_roi = (total_return_rate ** (1/years) - 1) * 100
+
+                # 边界保护：防止极端收益率导致数学溢出
+                if total_return_rate <= 0:
+                    annualized_roi = -99.99  # 完全亏损
+                    logger.warning(f"时间加权ROI: 收益率<=0 ({total_return_rate:.4f})")
+                elif total_return_rate > 1000:
+                    # 超过1000倍收益，限制为合理上限
+                    logger.warning(
+                        f"时间加权ROI: 极端收益率 {total_return_rate:.2f}倍 "
+                        f"(账户=${account_value:,.2f}, 初始=${initial_capital_total:,.2f}), "
+                        f"限制年化ROI为10,000%"
+                    )
+                    annualized_roi = 10000.0
+                else:
+                    # 使用对数检查是否会溢出
+                    import math
+                    try:
+                        log_return = math.log(total_return_rate)
+                        exponent = log_return / years
+
+                        # 检查指数是否会导致溢出（e^700 约为 10^304）
+                        if exponent > 700:
+                            logger.warning(
+                                f"时间加权ROI: 年化计算会溢出: ln({total_return_rate:.2f})/{years:.6f} = {exponent:.2f}, "
+                                f"限制年化ROI为10,000%"
+                            )
+                            annualized_roi = 10000.0
+                        elif exponent < -700:
+                            logger.warning(
+                                f"时间加权ROI: 年化计算接近0: ln({total_return_rate:.2f})/{years:.6f} = {exponent:.2f}, "
+                                f"设置为-99.99%"
+                            )
+                            annualized_roi = -99.99
+                        else:
+                            # 安全计算
+                            annualized_roi = (total_return_rate ** (1/years) - 1) * 100
+
+                            # 二次边界检查
+                            if annualized_roi > 10000:
+                                logger.warning(f"时间加权ROI: 年化ROI过高 ({annualized_roi:.2f}%)，限制为10,000%")
+                                annualized_roi = 10000.0
+                            elif annualized_roi < -99.99:
+                                logger.warning(f"时间加权ROI: 年化ROI过低 ({annualized_roi:.2f}%)，限制为-99.99%")
+                                annualized_roi = -99.99
+                    except (OverflowError, ValueError, ZeroDivisionError) as e:
+                        logger.error(
+                            f"时间加权ROI: 年化ROI计算错误: {e} "
+                            f"(收益率={total_return_rate:.2f}, years={years:.6f}), "
+                            f"设置为0"
+                        )
+                        annualized_roi = 0.0
             else:
                 annualized_roi = 0.0
         else:
@@ -602,32 +783,103 @@ class MetricsEngine:
             # 2. 转换为年化收益率（基于实际天数）
             years = time_span_days / MetricsEngine.ANNUAL_DAYS
             if years > 0:
-                # 年化公式: (1 + 总收益)^(1/年数) - 1
-                annual_return = (1 + total_return) ** (1 / years) - 1
+                # 🛡️ 年化公式: (1 + 总收益)^(1/年数) - 1
+                # 添加防护：防止数学溢出和无效值
+
+                # 防护1：爆仓场景（total_return <= -1）
+                if total_return <= -1:
+                    annual_return = -0.9999  # 限制为 -99.99%
+                    logger.warning(f"年化ROI过低 ({total_return*100:.2f}%)，限制为-99.99%")
+                else:
+                    try:
+                        # 防护2：确保底数 > 0（避免负数的非整数次幂）
+                        base = max(1 + total_return, 0.0001)
+                        exponent = 1 / years
+
+                        # 防护3：预检查防止指数爆炸（base^exponent 可能溢出）
+                        # 当 base > 1 且 exponent > 100 时，结果会非常大
+                        if base > 1 and exponent > 100:
+                            # log(base^exponent) = exponent * log(base)
+                            # 如果 exponent * log(base) > 230，结果会溢出
+                            log_result = exponent * np.log(base)
+                            if log_result > 230:  # e^230 ≈ 10^100
+                                annual_return = 100.0  # 限制为 10000%
+                                logger.warning(
+                                    f"[Enhanced] 年化收益率过大: "
+                                    f"base={base:.4f}, exponent={exponent:.2f}, "
+                                    f"限制为 ±10000%"
+                                )
+                            else:
+                                annual_return = base ** exponent - 1
+                        else:
+                            annual_return = base ** exponent - 1
+
+                        # 防护4：钳制最终结果到合理范围
+                        MAX_ANNUAL_RETURN = 100.0  # 10000%
+                        if annual_return > MAX_ANNUAL_RETURN:
+                            logger.warning(
+                                f"[Enhanced] 年化收益率过大: {annual_return*100:.2f}%, "
+                                f"限制为 ±{MAX_ANNUAL_RETURN*100:.0f}%"
+                            )
+                            annual_return = MAX_ANNUAL_RETURN
+                        elif annual_return < -0.9999:
+                            annual_return = -0.9999
+
+                    except (OverflowError, ValueError, FloatingPointError) as e:
+                        logger.error(f"年化收益率计算异常: {type(e).__name__}: {e}")
+                        annual_return = 0.0
             else:
                 annual_return = 0.0
 
-            # 3. 年化标准差（基于每日波动）
-            # 假设每天交易一次,计算日波动
-            daily_volatility = std_return * np.sqrt(trading_days / time_span_days)
-            annual_std = daily_volatility * np.sqrt(MetricsEngine.ANNUAL_DAYS)
+            # 3. 年化标准差（修复版：使用更稳健的方法）
+            # 计算平均每笔交易的时间间隔（天）
+            avg_days_per_trade = time_span_days / max(trading_days - 1, 1)
 
-            # 异常值保护
+            # 方法A：基于交易频率的年化标准差（推荐）
+            # 假设：年化波动 = 单笔交易波动 × sqrt(年交易次数)
+            trades_per_year = MetricsEngine.ANNUAL_DAYS / avg_days_per_trade
+            annual_std = std_return * np.sqrt(trades_per_year)
+
+            # 方法B（备选）：基于时间加权的年化标准差
+            # annual_std = std_return * np.sqrt(MetricsEngine.ANNUAL_DAYS / avg_days_per_trade)
+
+            # 🛡️ 强化异常值保护
+            # 1. 检查 annual_std 是否过小（可能导致 Sharpe 虚高）
+            MIN_ANNUAL_STD = 0.01  # 最小年化标准差 1%
+            if annual_std < MIN_ANNUAL_STD:
+                logger.warning(
+                    f"年化标准差过小: {annual_std:.6f}, "
+                    f"调整为最小值 {MIN_ANNUAL_STD:.2%}"
+                )
+                annual_std = MIN_ANNUAL_STD
+
+            # 2. 检查是否为 NaN 或 Inf
             if np.isnan(annual_return) or np.isinf(annual_return):
+                logger.warning(f"年化收益率异常: {annual_return}")
                 annual_return = 0.0
-            if np.isnan(annual_std) or np.isinf(annual_std) or annual_std == 0:
+            if np.isnan(annual_std) or np.isinf(annual_std):
+                logger.warning(f"年化标准差异常: {annual_std}")
                 annual_std = 1.0
+
+            # 3. 检查年化标准差是否合理（应在 1%-500% 范围内）
+            if annual_std > 5.0:  # >500%
+                logger.warning(
+                    f"年化标准差异常大: {annual_std:.2%}, "
+                    f"交易频率={trades_per_year:.1f}次/年, "
+                    f"单笔波动={std_return:.2%}"
+                )
+                # 不强制调整，仅警告
         else:
             annual_return = 0.0
             annual_std = 1.0
 
-        # 异常值检测
+        # 🛡️ 最终异常值检测（双重保护）
         if annual_std == 0 or np.isnan(annual_std) or np.isinf(annual_std):
-            logger.warning(f"年化标准差异常: {annual_std}")
+            logger.warning(f"年化标准差最终检查失败: {annual_std}")
             return 0.0
 
         if np.isnan(annual_return) or np.isinf(annual_return):
-            logger.warning(f"年化收益率异常: {annual_return}")
+            logger.warning(f"年化收益率最终检查失败: {annual_return}")
             return 0.0
 
         # 夏普比率 = (年化收益率 - 无风险利率) / 年化标准差
@@ -635,14 +887,25 @@ class MetricsEngine:
 
         # 异常值处理
         if np.isnan(sharpe) or np.isinf(sharpe):
+            logger.warning("Sharpe 比率计算结果为 NaN 或 Inf")
             return 0.0
 
-        # Sharpe > 10 通常表明计算错误
-        if abs(sharpe) > 10:
+        # 🎯 强化上限检查（Sharpe > 10 极为罕见）
+        MAX_REASONABLE_SHARPE = 10.0  # 正常范围：-3 到 +10
+
+        if abs(sharpe) > MAX_REASONABLE_SHARPE:
             logger.warning(
-                f"Sharpe 比率异常大: {sharpe:.2f}, "
-                f"年化收益={annual_return:.2%}, 波动={annual_std:.2%}"
+                f"⚠️  Sharpe 比率异常: {sharpe:.4f} (超出合理范围 ±{MAX_REASONABLE_SHARPE})\n"
+                f"   年化收益率: {annual_return:.2%}\n"
+                f"   年化标准差: {annual_std:.2%}\n"
+                f"   交易笔数: {trading_days}\n"
+                f"   时间跨度: {time_span_days:.1f} 天\n"
+                f"   单笔收益率标准差: {std_return:.4f}\n"
+                f"   建议：检查数据质量或使用固定本金算法"
             )
+
+            # 强制限制在合理范围内
+            sharpe = np.sign(sharpe) * MAX_REASONABLE_SHARPE
 
         # 数据库边界保护：DECIMAL(10, 4) 最大值为 999,999.9999
         sharpe = max(-999999.9999, min(999999.9999, sharpe))
@@ -657,7 +920,11 @@ class MetricsEngine:
         actual_initial_capital: Optional[float] = None,
         ledger: Optional[List[Dict]] = None,
         address: Optional[str] = None,
-        state: Optional[Dict] = None
+        state: Optional[Dict] = None,
+        # 性能优化：预计算数据参数
+        precalculated_events: Optional[List[Dict]] = None,
+        precalculated_realized_pnl: Optional[float] = None,
+        precalculated_sorted_fills: Optional[List[Dict]] = None
     ) -> tuple[float, Dict]:
         """
         改进版Sharpe比率计算（P2优化：集成出入金和资金费率）
@@ -666,6 +933,7 @@ class MetricsEngine:
         1. 集成ledger数据，正确处理出入金对资金基准的影响
         2. 整合资金费率数据，计入总收益
         3. 基于动态资金基准计算收益率序列
+        4. P1性能优化：支持预计算数据，避免重复遍历
 
         Args:
             fills: 交易记录列表
@@ -674,6 +942,9 @@ class MetricsEngine:
             ledger: 出入金记录（可选）
             address: 钱包地址（可选）
             state: 用户状态数据（包含资金费率，可选）
+            precalculated_events: 预计算的事件列表（性能优化）
+            precalculated_realized_pnl: 预计算的已实现PNL（性能优化）
+            precalculated_sorted_fills: 预排序的fills列表（性能优化）
 
         Returns:
             (sharpe_ratio, details)
@@ -703,30 +974,40 @@ class MetricsEngine:
                 # 为了统一，我们将"收到"作为正收益
                 funding_pnl -= float(all_time_funding)
 
-        # 2. 合并交易和出入金事件
-        events = []
+        # 2. P1优化：使用预计算的events（如果提供）
+        if precalculated_events is not None:
+            events = precalculated_events
+        else:
+            # 原有逻辑：合并交易和出入金事件
+            events = []
 
-        # 添加交易事件
-        for fill in fills:
-            events.append({
-                'time': fill.get('time', 0),
-                'type': 'trade',
-                'pnl': MetricsEngine._get_pnl(fill)
-            })
+            # 添加交易事件
+            for fill in fills:
+                events.append({
+                    'time': fill.get('time', 0),
+                    'type': 'trade',
+                    'pnl': MetricsEngine._get_pnl(fill)
+                })
 
-        # 添加出入金事件
-        if ledger and address:
-            for record in ledger:
-                amount = cls._extract_ledger_amount(record, address)
-                if amount != 0:
-                    events.append({
-                        'time': record.get('time', 0),
-                        'type': 'cash_flow',
-                        'amount': amount
-                    })
+            # 添加出入金事件
+            if ledger and address:
+                for record in ledger:
+                    amount = cls._extract_ledger_amount(record, address)
+                    if amount != 0:
+                        events.append({
+                            'time': record.get('time', 0),
+                            'type': 'cash_flow',
+                            'amount': amount
+                        })
 
-        # 3. 按时间排序
-        events.sort(key=lambda x: x['time'])
+            # 按时间排序
+            events.sort(key=lambda x: x['time'])
+
+        # 3. P1优化：使用预计算的 realized_pnl
+        if precalculated_realized_pnl is not None:
+            trading_pnl_for_initial = precalculated_realized_pnl
+        else:
+            trading_pnl_for_initial = sum(e['pnl'] for e in events if e['type'] == 'trade')
 
         # 4. 确定初始资金
         if actual_initial_capital is not None and actual_initial_capital > 0:
@@ -734,8 +1015,7 @@ class MetricsEngine:
             quality = 'enhanced'
         else:
             # 推算初始资金：当前价值 - 已实现盈亏 - 资金费
-            realized_pnl = sum(e['pnl'] for e in events if e['type'] == 'trade')
-            initial_capital = account_value - realized_pnl - funding_pnl
+            initial_capital = account_value - trading_pnl_for_initial - funding_pnl
 
             if initial_capital <= 0:
                 initial_capital = max(account_value, 1000)
@@ -778,7 +1058,8 @@ class MetricsEngine:
 
         # 6. 将资金费率加入总收益（在计算年化收益时考虑）
         # 资金费率视为额外收益，分摊到整个交易周期
-        total_trading_pnl = sum(e['pnl'] for e in events if e['type'] == 'trade')
+        # P1优化：复用已计算的 trading_pnl
+        total_trading_pnl = trading_pnl_for_initial
         total_pnl_with_funding = total_trading_pnl + funding_pnl
 
         # 计算资金费率贡献百分比
@@ -796,7 +1077,11 @@ class MetricsEngine:
             return 0.0, {'quality': quality, 'funding_pnl': funding_pnl, 'funding_contribution': funding_contribution}
 
         # 计算时间跨度
-        sorted_fills = cls._ensure_sorted_fills(fills)
+        # P1优化：使用预计算的 sorted_fills
+        if precalculated_sorted_fills is not None:
+            sorted_fills = precalculated_sorted_fills
+        else:
+            sorted_fills = cls._ensure_sorted_fills(fills)
         first_time = sorted_fills[0]['time']
         last_time = sorted_fills[-1]['time']
 
@@ -816,32 +1101,118 @@ class MetricsEngine:
             if years > 0:
                 # 使用包含资金费的总收益计算年化
                 total_return_with_funding = total_pnl_with_funding / initial_capital
-                annual_return = (1 + total_return_with_funding) ** (1 / years) - 1
+
+                # 🛡️ 防止指数运算溢出
+                # 当交易天数太短时，直接使用简单年化而非复利
+                MIN_YEARS_FOR_COMPOUND = 0.08  # 至少30天（30/365≈0.08）
+
+                if years < MIN_YEARS_FOR_COMPOUND:
+                    # 简单年化：收益率 × (365 / 天数)
+                    annual_return = total_return_with_funding * (1 / years)
+                    logger.debug(
+                        f"[Enhanced] 使用简单年化（交易期间太短: {years*365:.0f}天）, "
+                        f"收益率={annual_return:.2%}"
+                    )
+                else:
+                    # 复利年化：(1 + 总收益) ^ (1/年数) - 1
+                    try:
+                        # 限制总收益率范围：[-0.99, 100]（防止溢出）
+                        total_return_capped = max(-0.99, min(total_return_with_funding, 100))
+
+                        annual_return = (1 + total_return_capped) ** (1 / years) - 1
+
+                        # 检查是否溢出
+                        if np.isnan(annual_return) or np.isinf(annual_return) or abs(annual_return) > 100:
+                            # 溢出，使用简单年化
+                            annual_return = total_return_with_funding * (1 / years)
+                            logger.warning(
+                                f"[Enhanced] 复利年化溢出，降级为简单年化: {annual_return:.2%}"
+                            )
+                    except (OverflowError, ValueError) as e:
+                        # 指数运算溢出，使用简单年化
+                        annual_return = total_return_with_funding * (1 / years)
+                        logger.warning(
+                            f"[Enhanced] 年化计算异常: {e}, 降级为简单年化"
+                        )
+
+                # 最终上限保护：年化收益率不应超过 ±10000%
+                MAX_ANNUAL_RETURN = 100.0  # ±10000%
+                if abs(annual_return) > MAX_ANNUAL_RETURN:
+                    logger.warning(
+                        f"[Enhanced] 年化收益率过大: {annual_return:.2%}, "
+                        f"限制为 ±{MAX_ANNUAL_RETURN*100:.0f}%"
+                    )
+                    annual_return = np.sign(annual_return) * MAX_ANNUAL_RETURN
             else:
                 annual_return = 0.0
 
-            # 年化波动率
-            daily_volatility = std_return * np.sqrt(trading_days / time_span_days)
-            annual_std = daily_volatility * np.sqrt(MetricsEngine.ANNUAL_DAYS)
+            # 🔧 修复：年化标准差（使用更稳健的方法）
+            # 计算平均每笔交易的时间间隔（天）
+            avg_days_per_trade = time_span_days / max(trading_days - 1, 1)
 
-            # 异常值保护
+            # 方法：基于交易频率的年化标准差
+            # 假设：年化波动 = 单笔交易波动 × sqrt(年交易次数)
+            trades_per_year = MetricsEngine.ANNUAL_DAYS / avg_days_per_trade
+            annual_std = std_return * np.sqrt(trades_per_year)
+
+            # 🛡️ 强化异常值保护
+            # 1. 最小年化标准差保护（防止 Sharpe 虚高）
+            MIN_ANNUAL_STD = 0.01  # 最小年化标准差 1%
+            if annual_std < MIN_ANNUAL_STD:
+                logger.warning(
+                    f"[Enhanced] 年化标准差过小: {annual_std:.6f}, "
+                    f"调整为最小值 {MIN_ANNUAL_STD:.2%}"
+                )
+                annual_std = MIN_ANNUAL_STD
+
+            # 2. NaN/Inf 检查
             if np.isnan(annual_return) or np.isinf(annual_return):
+                logger.warning(f"[Enhanced] 年化收益率异常: {annual_return}")
                 annual_return = 0.0
-            if np.isnan(annual_std) or np.isinf(annual_std) or annual_std == 0:
+            if np.isnan(annual_std) or np.isinf(annual_std):
+                logger.warning(f"[Enhanced] 年化标准差异常: {annual_std}")
                 annual_std = 1.0
+
+            # 3. 合理性检查（应在 1%-500% 范围内）
+            if annual_std > 5.0:  # >500%
+                logger.warning(
+                    f"[Enhanced] 年化标准差异常大: {annual_std:.2%}, "
+                    f"交易频率={trades_per_year:.1f}次/年, "
+                    f"单笔波动={std_return:.2%}"
+                )
         else:
             annual_return = 0.0
             annual_std = 1.0
 
         # 计算Sharpe比率
         if annual_std == 0 or np.isnan(annual_std) or np.isinf(annual_std):
+            logger.warning("[Enhanced] 最终年化标准差检查失败")
             sharpe = 0.0
         else:
             sharpe = (annual_return - cls.get_risk_free_rate()) / annual_std
 
         # 异常值处理
         if np.isnan(sharpe) or np.isinf(sharpe):
+            logger.warning("[Enhanced] Sharpe 比率计算结果为 NaN 或 Inf")
             sharpe = 0.0
+
+        # 🎯 强化上限检查（Sharpe > 10 极为罕见）
+        MAX_REASONABLE_SHARPE = 10.0
+
+        if abs(sharpe) > MAX_REASONABLE_SHARPE:
+            logger.warning(
+                f"⚠️  [Enhanced] Sharpe 比率异常: {sharpe:.4f} (超出合理范围 ±{MAX_REASONABLE_SHARPE})\n"
+                f"   年化收益率: {annual_return:.2%}\n"
+                f"   年化标准差: {annual_std:.2%}\n"
+                f"   交易笔数: {trading_days}\n"
+                f"   时间跨度: {time_span_days:.1f} 天\n"
+                f"   单笔收益率标准差: {std_return:.4f}\n"
+                f"   资金费率贡献: ${funding_pnl:.2f} ({funding_contribution:.1f}%)\n"
+                f"   建议：检查数据质量或使用固定本金算法"
+            )
+
+            # 强制限制在合理范围内
+            sharpe = np.sign(sharpe) * MAX_REASONABLE_SHARPE
 
         # 边界保护
         sharpe = max(-999999.9999, min(999999.9999, sharpe))
@@ -916,7 +1287,11 @@ class MetricsEngine:
         actual_initial_capital: Optional[float] = None,
         ledger: Optional[List[Dict]] = None,
         address: Optional[str] = None,
-        state: Optional[Dict] = None  # 新增：用于获取未实现盈亏
+        state: Optional[Dict] = None,  # 用于获取未实现盈亏
+        # P1性能优化：预计算数据参数
+        precalculated_events: Optional[List[Dict]] = None,
+        precalculated_realized_pnl: Optional[float] = None,
+        precalculated_sorted_fills: Optional[List[Dict]] = None
     ) -> tuple[float, Dict]:
         """
         计算最大回撤（改进版：考虑出入金影响）
@@ -927,6 +1302,7 @@ class MetricsEngine:
         3. 修复初始峰值可能为负的BUG
         4. 支持真实初始资金（如果提供出入金数据）
         5. ✨ 考虑出入金事件（提现不算回撤，充值调整峰值）
+        6. P1性能优化：支持预计算数据，避免重复遍历
 
         Args:
             fills: 交易记录列表（按时间排序）
@@ -934,6 +1310,10 @@ class MetricsEngine:
             actual_initial_capital: 实际初始资金（可选）
             ledger: 出入金记录（可选，提供则使用改进算法）
             address: 用户地址（使用ledger时必需）
+            state: 用户状态数据（用于获取未实现盈亏）
+            precalculated_events: 预计算的事件列表（性能优化）
+            precalculated_realized_pnl: 预计算的已实现PNL（性能优化）
+            precalculated_sorted_fills: 预排序的fills列表（性能优化）
 
         Returns:
             (max_drawdown_pct, details)
@@ -969,12 +1349,14 @@ class MetricsEngine:
         # 如果提供了ledger数据，使用改进算法
         if ledger is not None and address is not None:
             return cls._calculate_dd_with_ledger(
-                fills, ledger, account_value, actual_initial_capital, address, state
+                fills, ledger, account_value, actual_initial_capital, address, state,
+                precalculated_events, precalculated_realized_pnl
             )
         else:
             # 降级到旧算法
             dd_pct, quality = cls._calculate_dd_legacy(
-                fills, account_value, actual_initial_capital
+                fills, account_value, actual_initial_capital,
+                precalculated_realized_pnl, precalculated_sorted_fills
             )
             details = {
                 'max_drawdown': dd_pct,
@@ -990,7 +1372,10 @@ class MetricsEngine:
         cls,
         fills: List[Dict],
         account_value: float,
-        actual_initial_capital: Optional[float] = None
+        actual_initial_capital: Optional[float] = None,
+        # P1性能优化参数
+        precalculated_realized_pnl: Optional[float] = None,
+        precalculated_sorted_fills: Optional[List[Dict]] = None
     ) -> tuple[float, str]:
         """
         旧版最大回撤计算（保留作为降级方案）
@@ -998,15 +1383,22 @@ class MetricsEngine:
         Returns:
             (max_drawdown_pct, quality)
         """
-        # 按时间排序（带优化检测）
-        sorted_fills = cls._ensure_sorted_fills(fills)
+        # P1优化：使用预排序的fills
+        if precalculated_sorted_fills is not None:
+            sorted_fills = precalculated_sorted_fills
+        else:
+            sorted_fills = cls._ensure_sorted_fills(fills)
 
         # 确定初始资金：优先使用真实初始资金，否则推算
         if actual_initial_capital is not None and actual_initial_capital > 0:
             initial_capital = actual_initial_capital
             quality = 'standard'
         else:
-            realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
+            # P1优化：使用预计算的realized_pnl
+            if precalculated_realized_pnl is not None:
+                realized_pnl = precalculated_realized_pnl
+            else:
+                realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
             initial_capital = account_value - realized_pnl
             quality = 'estimated'
 
@@ -1056,7 +1448,10 @@ class MetricsEngine:
         account_value: float,
         actual_initial_capital: Optional[float],
         address: str,
-        state: Optional[Dict] = None  # 新增：用于获取未实现盈亏
+        state: Optional[Dict] = None,  # 用于获取未实现盈亏
+        # P1性能优化参数
+        precalculated_events: Optional[List[Dict]] = None,
+        precalculated_realized_pnl: Optional[float] = None
     ) -> tuple[float, Dict]:
         """
         改进版最大回撤计算（考虑出入金和未实现盈亏）
@@ -1066,40 +1461,49 @@ class MetricsEngine:
         2. 出入金事件调整峰值（而非视为盈亏）
         3. 只有交易盈亏才会产生回撤
         4. 可选：计算含未实现盈亏的回撤
+        5. P1性能优化：支持预计算数据
 
         Returns:
             (max_drawdown_pct, details)
         """
-        # 1. 合并所有事件
-        events = []
+        # P1优化：使用预计算的events
+        if precalculated_events is not None:
+            events = precalculated_events
+        else:
+            # 1. 合并所有事件
+            events = []
 
-        # 添加交易事件
-        for fill in fills:
-            events.append({
-                'time': fill.get('time', 0),
-                'type': 'trade',
-                'pnl': MetricsEngine._get_pnl(fill)
-            })
-
-        # 添加出入金事件
-        for record in ledger:
-            amount = cls._extract_ledger_amount(record, address)
-            if amount != 0:
+            # 添加交易事件
+            for fill in fills:
                 events.append({
-                    'time': record.get('time', 0),
-                    'type': 'cash_flow',
-                    'amount': amount  # 正数=流入，负数=流出
+                    'time': fill.get('time', 0),
+                    'type': 'trade',
+                    'pnl': MetricsEngine._get_pnl(fill)
                 })
 
-        # 2. 按时间排序
-        events.sort(key=lambda x: x['time'])
+            # 添加出入金事件
+            for record in ledger:
+                amount = cls._extract_ledger_amount(record, address)
+                if amount != 0:
+                    events.append({
+                        'time': record.get('time', 0),
+                        'type': 'cash_flow',
+                        'amount': amount  # 正数=流入，负数=流出
+                    })
 
-        # 3. 确定初始资金
+            # 按时间排序
+            events.sort(key=lambda x: x['time'])
+
+        # 2. 确定初始资金
         if actual_initial_capital is not None and actual_initial_capital > 0:
             initial_capital = actual_initial_capital
             quality = 'enhanced'
         else:
-            realized_pnl = sum(e['pnl'] for e in events if e['type'] == 'trade')
+            # P1优化：使用预计算的realized_pnl
+            if precalculated_realized_pnl is not None:
+                realized_pnl = precalculated_realized_pnl
+            else:
+                realized_pnl = sum(e['pnl'] for e in events if e['type'] == 'trade')
             initial_capital = account_value - realized_pnl
             quality = 'standard'
 
@@ -1521,7 +1925,10 @@ class MetricsEngine:
         cls,
         fills: List[Dict],
         account_value: float,
-        actual_initial_capital: Optional[float] = None
+        actual_initial_capital: Optional[float] = None,
+        # P1性能优化参数
+        precalculated_realized_pnl: Optional[float] = None,
+        precalculated_sorted_fills: Optional[List[Dict]] = None
     ) -> int:
         """
         检测爆仓次数（资金降至 0 或负值）
@@ -1530,6 +1937,8 @@ class MetricsEngine:
             fills: 交易记录列表（按时间排序）
             account_value: 当前账户价值
             actual_initial_capital: 实际初始资金（可选）
+            precalculated_realized_pnl: 预计算的已实现PNL（性能优化）
+            precalculated_sorted_fills: 预排序的fills列表（性能优化）
 
         Returns:
             爆仓次数
@@ -1541,14 +1950,21 @@ class MetricsEngine:
         if actual_initial_capital is not None and actual_initial_capital > 0:
             initial_capital = actual_initial_capital
         else:
-            realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
+            # P1优化：使用预计算的realized_pnl
+            if precalculated_realized_pnl is not None:
+                realized_pnl = precalculated_realized_pnl
+            else:
+                realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
             initial_capital = account_value - realized_pnl
 
         if initial_capital <= 0:
             initial_capital = max(account_value, 1000)
 
-        # 按时间排序（带优化检测）
-        sorted_fills = cls._ensure_sorted_fills(fills)
+        # P1优化：使用预排序的fills
+        if precalculated_sorted_fills is not None:
+            sorted_fills = precalculated_sorted_fills
+        else:
+            sorted_fills = cls._ensure_sorted_fills(fills)
 
         # 检测爆仓
         bankruptcy_count = 0
@@ -1660,8 +2076,6 @@ class MetricsEngine:
                 sharpe_ratio=0.0,
                 total_pnl=0.0,
                 account_value=0.0,
-                perp_value=0.0,
-                spot_value=0.0,
                 max_drawdown=0.0,
                 avg_trade_size=0.0,
                 total_volume=0.0,
@@ -1670,13 +2084,12 @@ class MetricsEngine:
                 active_days=0
             )
 
-        # 获取 Perp 账户价值
-        perp_value = float(
+        # 直接计算总账户价值
+        perp_value_temp = float(
             (state or {}).get('marginSummary', {}).get('accountValue', 0)
         )
 
-        # 获取 Spot 账户价值
-        spot_value = 0.0
+        spot_value_temp = 0.0
         if spot_state and 'balances' in spot_state:
             for balance in spot_state['balances']:
                 coin = balance.get('coin', '')
@@ -1685,20 +2098,19 @@ class MetricsEngine:
                 if total > 0:
                     if coin == 'USDC':
                         # USDC 按 1:1 计价
-                        spot_value += total
+                        spot_value_temp += total
                     else:
                         # 其他代币使用 entryNtl（入账价值）
                         entry_ntl = float(balance.get('entryNtl', 0))
-                        spot_value += entry_ntl
+                        spot_value_temp += entry_ntl
 
-        # 计算总账户价值 = Perp + Spot
-        account_value = perp_value + spot_value
+        # 计算总账户价值
+        account_value = perp_value_temp + spot_value_temp
 
-        logger.info(f"账户价值计算: Perp=${perp_value:,.2f}, Spot=${spot_value:,.2f}, 总计=${account_value:,.2f}")
+        logger.info(f"账户价值: ${account_value:,.2f}")
 
         # 提取出入金数据
         has_transfer_data = transfer_data is not None
-        net_deposits = transfer_data.get('net_deposits', 0.0) if transfer_data else 0.0
         total_deposits = transfer_data.get('total_deposits', 0.0) if transfer_data else 0.0
         total_withdrawals = transfer_data.get('total_withdrawals', 0.0) if transfer_data else 0.0
 
@@ -1710,37 +2122,141 @@ class MetricsEngine:
         # 计算真实本金（仅充值/提现，不含转账）
         true_capital = (total_deposits - total_withdrawals) if has_transfer_data else 0.0
 
-        # 计算各项指标
-        win_rate = cls.calculate_win_rate(fills)
-
-        # 计算PNL和ROI（扩展版返回5个值，支持两种本金口径）
-        total_pnl, legacy_roi, actual_initial, corrected_roi, true_capital_roi = cls.calculate_pnl_and_roi(
-            fills, account_value, net_deposits, has_transfer_data, true_capital
-        )
-
-        # 计算时间加权ROI（P1优化，如果有ledger数据）
+        # ========== P1性能优化：单次遍历收集所有数据 ==========
         ledger_data = transfer_data.get('ledger', None) if transfer_data else None
+        collected = cls._collect_metrics_data(fills, ledger_data, address)
+
+        # 从预收集数据中提取指标
+        realized_pnl = collected['realized_pnl']
+        winning_trades = collected['winning_trades']
+        losing_trades = collected['losing_trades']
+        zero_pnl_trades = collected['zero_pnl_trades']
+        total_volume = collected['total_volume']
+        avg_trade_size = collected['avg_trade_size']
+        active_days = collected['active_days']
+        sorted_fills = collected['sorted_fills']
+        events = collected['events']
+        first_trade_time = collected['first_trade_time']
+        last_trade_time = collected['last_trade_time']
+
+        # 使用预收集数据计算胜率（避免重复遍历）
+        total_pnl_trades = winning_trades + losing_trades
+        win_rate = (winning_trades / total_pnl_trades * 100) if total_pnl_trades > 0 else 0.0
+        win_rate = max(0.0, min(100.0, win_rate))
+
+        # 使用预收集的 realized_pnl 计算 PNL 和 ROI
+        total_pnl = realized_pnl
+
+        # 计算推算的初始资金
+        estimated_initial = account_value - realized_pnl
+
+        # 如果有出入金数据，计算真实初始资金
+        if has_transfer_data:
+            actual_initial = cls.calculate_actual_initial_capital(
+                account_value, realized_pnl, 0.0  # net_deposits=0 因为我们用 true_capital
+            )
+            # 基于真实本金计算 ROI
+            if true_capital > 0:
+                true_capital_roi = (realized_pnl / true_capital) * 100
+                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
+            elif actual_initial > 0:
+                true_capital_roi = (realized_pnl / actual_initial) * 100
+                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
+            else:
+                true_capital_roi = 0.0
+        else:
+            actual_initial = estimated_initial if estimated_initial > 0 else max(account_value, 100)
+            if estimated_initial > 0:
+                true_capital_roi = (realized_pnl / estimated_initial) * 100
+                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
+            else:
+                true_capital_roi = 0.0
+
+        # 计算时间加权ROI（如果有ledger数据）
+        # P1优化：ledger_data 已在前面提取
         if ledger_data and address:
             time_weighted_roi, annualized_roi, total_roi, roi_quality = cls.calculate_time_weighted_roi(
                 fills, ledger_data, account_value, address, state
             )
         else:
             # 降级：无ledger数据时使用简单年化
-            time_weighted_roi = corrected_roi
+            time_weighted_roi = true_capital_roi
 
-            # 确保fills已排序
-            sorted_fills_for_roi = cls._ensure_sorted_fills(fills)
+            # P1优化：使用预排序的fills（避免重复排序）
+            # 计算总天数（兼容 datetime 和毫秒时间戳）
+            if len(sorted_fills) > 0:
+                time_diff = last_trade_time - first_trade_time
+                # 如果是 timedelta 对象，转换为天数
+                from datetime import timedelta
+                if isinstance(time_diff, timedelta):
+                    total_days = time_diff.total_seconds() / 86400
+                elif isinstance(first_trade_time, datetime):
+                    # datetime 对象相减得到 timedelta
+                    total_days = (last_trade_time - first_trade_time).total_seconds() / 86400
+                else:
+                    # 假设是毫秒时间戳
+                    total_days = time_diff / (1000 * 86400)
+            else:
+                total_days = 1
 
-            total_days = (
-                (sorted_fills_for_roi[-1].get('time', 0) - sorted_fills_for_roi[0].get('time', 0)) / (1000 * 86400)
-                if len(sorted_fills_for_roi) > 0 else 1
-            )
             years = max(total_days / 365, 1/365)
             if years > 0 and actual_initial > 0:
                 total_return_rate = account_value / actual_initial
-                annualized_roi = (total_return_rate ** (1/years) - 1) * 100
+
+                # 边界保护：防止极端收益率导致数学溢出
+                if total_return_rate <= 0:
+                    # 负收益率或0，使用简单ROI
+                    annualized_roi = true_capital_roi
+                    logger.warning(f"收益率<=0 ({total_return_rate:.4f})，使用校准ROI")
+                elif total_return_rate > 1000:
+                    # 超过1000倍收益（100,000%），限制为合理上限
+                    logger.warning(
+                        f"极端收益率检测: {total_return_rate:.2f}倍 "
+                        f"(账户价值=${account_value:,.2f}, 初始资金=${actual_initial:,.2f}), "
+                        f"限制年化ROI为10,000%"
+                    )
+                    annualized_roi = 10000.0  # 设置合理上限
+                else:
+                    # 使用对数检查是否会溢出：ln(total_return_rate) / years
+                    # 如果这个值太大（>700），exp会溢出
+                    import math
+                    try:
+                        log_return = math.log(total_return_rate)
+                        exponent = log_return / years
+
+                        # 检查指数是否会导致溢出（e^700 约为 10^304）
+                        if exponent > 700:
+                            logger.warning(
+                                f"年化计算会溢出: ln({total_return_rate:.2f})/{years:.6f} = {exponent:.2f}, "
+                                f"限制年化ROI为10,000%"
+                            )
+                            annualized_roi = 10000.0
+                        elif exponent < -700:
+                            logger.warning(
+                                f"年化计算接近0: ln({total_return_rate:.2f})/{years:.6f} = {exponent:.2f}, "
+                                f"设置为-99.99%"
+                            )
+                            annualized_roi = -99.99
+                        else:
+                            # 安全计算
+                            annualized_roi = (total_return_rate ** (1/years) - 1) * 100
+
+                            # 二次边界检查：年化ROI不应超过10,000%
+                            if annualized_roi > 10000:
+                                logger.warning(f"年化ROI过高 ({annualized_roi:.2f}%)，限制为10,000%")
+                                annualized_roi = 10000.0
+                            elif annualized_roi < -99.99:
+                                logger.warning(f"年化ROI过低 ({annualized_roi:.2f}%)，限制为-99.99%")
+                                annualized_roi = -99.99
+                    except (OverflowError, ValueError, ZeroDivisionError) as e:
+                        logger.error(
+                            f"年化ROI计算错误: {e} "
+                            f"(收益率={total_return_rate:.2f}, years={years:.6f}), "
+                            f"降级使用校准ROI"
+                        )
+                        annualized_roi = true_capital_roi
             else:
-                annualized_roi = corrected_roi
+                annualized_roi = true_capital_roi
 
             # 总ROI（含未实现）
             unrealized_pnl = sum(
@@ -1753,7 +2269,7 @@ class MetricsEngine:
             roi_quality = 'estimated'
 
         # 计算校正后的账户初始值（包含外部转入到 Spot）
-        ledger_data = transfer_data.get('ledger', None) if transfer_data else None
+        # P1优化：ledger_data 已在前面提取
         if ledger_data and has_transfer_data:
             initial_capital_corrected, external_to_spot, external_out = cls.calculate_initial_capital_corrected(
                 address, ledger_data, total_deposits, total_withdrawals
@@ -1763,65 +2279,25 @@ class MetricsEngine:
             external_to_spot = 0.0
             external_out = 0.0
 
-        # 计算累计收益率和年化收益率
-        cumulative_return = 0.0
-        annualized_return = 0.0
 
-        if initial_capital_corrected > 0:
-            # 累计收益 = 当前账户价值 - 账户初始值
-            cumulative_profit = account_value - initial_capital_corrected
-
-            # 累计收益率 = 累计收益 / 账户初始值 × 100%
-            cumulative_return = (cumulative_profit / initial_capital_corrected) * 100
-
-            # 计算年化收益率（复利计算）
-            sorted_fills_for_return = cls._ensure_sorted_fills(fills)
-            total_days = (
-                (sorted_fills_for_return[-1].get('time', 0) - sorted_fills_for_return[0].get('time', 0)) / (1000 * 86400)
-                if len(sorted_fills_for_return) > 0 else 1
-            )
-            years = max(total_days / 365, 1/365)
-
-            # 保护机制：对于活跃时间太短的账户，年化收益率可能不准确
-            MIN_DAYS_FOR_ANNUALIZED = 30  # 至少30天才计算年化收益率
-            MAX_ANNUALIZED_RETURN = 10000.0  # 年化收益率上限 ±10000%
-
-            if total_days < MIN_DAYS_FOR_ANNUALIZED:
-                # 活跃时间太短，使用简单年化公式而非复利
-                annualized_return = cumulative_return * (365 / total_days) if total_days > 0 else 0.0
-                # 仍然应用上限
-                annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
-            elif years > 0:
-                # 年化收益率 = (当前价值 / 初始值) ^ (1 / 年数) - 1
-                total_return_rate = account_value / initial_capital_corrected
-                try:
-                    annualized_return = (total_return_rate ** (1/years) - 1) * 100
-                    # 应用上限防止数值溢出
-                    annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
-                except (OverflowError, ValueError):
-                    # 如果计算溢出，使用简单年化
-                    annualized_return = cumulative_return * (365 / total_days) if total_days > 0 else 0.0
-                    annualized_return = max(min(annualized_return, MAX_ANNUALIZED_RETURN), -MAX_ANNUALIZED_RETURN)
-            else:
-                annualized_return = cumulative_return
-
-            logger.info(
-                f"累计收益率计算: 初始值=${initial_capital_corrected:,.2f}, "
-                f"当前值=${account_value:,.2f}, "
-                f"累计收益率={cumulative_return:.2f}%, "
-                f"年化收益率={annualized_return:.2f}%"
-            )
-        else:
-            logger.warning(f"账户初始值为0，无法计算累计收益率")
+        # ========== P1性能优化：传递预计算数据给各指标计算方法 ==========
 
         # 使用真实初始资金计算夏普比率（P2优化：集成出入金和资金费率）
+        # P1优化：传递预计算的 events, realized_pnl, sorted_fills
         sharpe_ratio, sharpe_details = cls.calculate_sharpe_ratio_enhanced(
-            fills, account_value, actual_initial, ledger_data, address, state
+            fills, account_value, actual_initial, ledger_data, address, state,
+            precalculated_events=events,
+            precalculated_realized_pnl=realized_pnl,
+            precalculated_sorted_fills=sorted_fills
         )
 
         # 计算最大回撤（使用改进算法，如果有ledger数据）
+        # P1优化：传递预计算的 events, realized_pnl, sorted_fills
         max_drawdown, dd_details = cls.calculate_max_drawdown(
-            fills, account_value, actual_initial, ledger_data, address, state  # P1: 传入state
+            fills, account_value, actual_initial, ledger_data, address, state,
+            precalculated_events=events,
+            precalculated_realized_pnl=realized_pnl,
+            precalculated_sorted_fills=sorted_fills
         )
 
         # 回撤期间详细分析（P2优化）
@@ -1833,31 +2309,31 @@ class MetricsEngine:
             )
 
         # 检测爆仓次数
-        bankruptcy_count = cls.detect_bankruptcy(fills, account_value, actual_initial)
+        # P1优化：传递预计算的 realized_pnl, sorted_fills
+        bankruptcy_count = cls.detect_bankruptcy(
+            fills, account_value, actual_initial,
+            precalculated_realized_pnl=realized_pnl,
+            precalculated_sorted_fills=sorted_fills
+        )
 
-        avg_trade_size, total_volume = cls.calculate_trade_statistics(fills)
-        active_days = cls.calculate_active_days(fills)
+        # P1优化：使用预收集的 avg_trade_size, total_volume, active_days
+        # 不再调用 calculate_trade_statistics 和 calculate_active_days
 
-        # 时间范围（带优化检测）
-        sorted_fills = cls._ensure_sorted_fills(fills)
-        first_trade_time = sorted_fills[0].get('time', 0)
-        last_trade_time = sorted_fills[-1].get('time', 0)
+        # P1优化：使用预收集的 first_trade_time, last_trade_time
+        # 不再调用 _ensure_sorted_fills
 
         logger.info(
             f"指标计算完成: {address} - 胜率:{win_rate:.1f}% "
-            f"ROI(旧):{legacy_roi:.1f}% ROI(校准):{corrected_roi:.1f}% ROI(真实本金):{true_capital_roi:.1f}%"
+            f"ROI(真实本金):{true_capital_roi:.1f}%"
         )
 
         return AddressMetrics(
             address=address,
             total_trades=len(fills),
             win_rate=win_rate,
-            roi=legacy_roi,  # 保留旧版ROI
             sharpe_ratio=sharpe_ratio,
             total_pnl=total_pnl,
             account_value=account_value,
-            perp_value=perp_value,
-            spot_value=spot_value,
             max_drawdown=max_drawdown,
             avg_trade_size=avg_trade_size,
             total_volume=total_volume,
@@ -1865,11 +2341,9 @@ class MetricsEngine:
             last_trade_time=last_trade_time,
             active_days=active_days,
             # 出入金字段（传统方法，包含转账）
-            net_deposits=net_deposits,
             total_deposits=total_deposits,
             total_withdrawals=total_withdrawals,
             actual_initial_capital=actual_initial,
-            corrected_roi=corrected_roi,
             # 转账字段（新增，区分盈亏转移）
             total_transfers_in=total_transfers_in,
             total_transfers_out=total_transfers_out,
@@ -1894,8 +2368,6 @@ class MetricsEngine:
             roi_quality=roi_quality,
             # 累计收益率指标（新增）
             initial_capital_corrected=initial_capital_corrected,
-            cumulative_return=cumulative_return,
-            annualized_return=annualized_return,
             # Sharpe比率扩展指标（P2优化）
             sharpe_quality=sharpe_details.get('quality', 'estimated'),
             funding_pnl=sharpe_details.get('funding_pnl', 0.0),

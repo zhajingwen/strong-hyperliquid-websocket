@@ -95,7 +95,7 @@ class DataStore:
             id BIGSERIAL,
             address VARCHAR(42) NOT NULL,
             time TIMESTAMPTZ NOT NULL,
-            type VARCHAR(10),
+            type VARCHAR(25),
             amount DECIMAL(20, 8),
             tx_hash VARCHAR(66),
             PRIMARY KEY (id, time)
@@ -116,7 +116,6 @@ class DataStore:
             address VARCHAR(42) PRIMARY KEY,
             total_trades INTEGER,
             win_rate DECIMAL(6, 2),
-            roi DECIMAL(12, 2),
             sharpe_ratio DECIMAL(10, 4),
             total_pnl DECIMAL(20, 8),
             account_value DECIMAL(20, 8),
@@ -142,11 +141,49 @@ class DataStore:
             updated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
+        -- 8. 用户账户状态表 (Perp)
+        CREATE TABLE IF NOT EXISTS user_states (
+            id BIGSERIAL,
+            address VARCHAR(42) NOT NULL,
+            snapshot_time TIMESTAMPTZ NOT NULL,
+            account_value DECIMAL(20, 8),
+            total_margin_used DECIMAL(20, 8),
+            total_ntl_pos DECIMAL(20, 8),
+            total_raw_usd DECIMAL(20, 8),
+            withdrawable DECIMAL(20, 8),
+            cross_margin_summary JSONB,
+            asset_positions JSONB,
+            PRIMARY KEY (id, snapshot_time)
+        );
+
+        -- 9. Spot账户状态表
+        CREATE TABLE IF NOT EXISTS spot_states (
+            id BIGSERIAL,
+            address VARCHAR(42) NOT NULL,
+            snapshot_time TIMESTAMPTZ NOT NULL,
+            balances JSONB,
+            PRIMARY KEY (id, snapshot_time)
+        );
+
+        -- 10. 资金费率历史表
+        CREATE TABLE IF NOT EXISTS funding_history (
+            address VARCHAR(42) NOT NULL,
+            time TIMESTAMPTZ NOT NULL,
+            coin VARCHAR(20) NOT NULL,
+            usdc DECIMAL(20, 8),
+            szi DECIMAL(20, 8),
+            funding_rate DECIMAL(20, 10),
+            PRIMARY KEY (time, address, coin)
+        );
+
         -- 索引优化
         CREATE INDEX IF NOT EXISTS idx_fills_address_time ON fills(address, time DESC);
         CREATE INDEX IF NOT EXISTS idx_transfers_address_time ON transfers(address, time DESC);
         CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at);
         CREATE INDEX IF NOT EXISTS idx_processing_status ON processing_status(status, retry_count);
+        CREATE INDEX IF NOT EXISTS idx_user_states_address_time ON user_states(address, snapshot_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_spot_states_address_time ON spot_states(address, snapshot_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_funding_history_address_time ON funding_history(address, time DESC);
         """
 
         # TimescaleDB hypertable 转换（需要单独执行）
@@ -158,6 +195,21 @@ class DataStore:
         );
 
         SELECT create_hypertable('transfers', 'time',
+            chunk_time_interval => INTERVAL '30 days',
+            if_not_exists => TRUE
+        );
+
+        SELECT create_hypertable('user_states', 'snapshot_time',
+            chunk_time_interval => INTERVAL '7 days',
+            if_not_exists => TRUE
+        );
+
+        SELECT create_hypertable('spot_states', 'snapshot_time',
+            chunk_time_interval => INTERVAL '7 days',
+            if_not_exists => TRUE
+        );
+
+        SELECT create_hypertable('funding_history', 'time',
             chunk_time_interval => INTERVAL '30 days',
             if_not_exists => TRUE
         );
@@ -640,6 +692,268 @@ class DataStore:
             rows = await conn.fetch(sql, address)
             return [dict(row) for row in rows]
 
+    async def get_latest_fill_time(self, address: str) -> Optional[int]:
+        """
+        获取地址最新的交易时间戳（用于增量更新）
+
+        Args:
+            address: 用户地址
+
+        Returns:
+            最新交易的时间戳（毫秒），如果没有记录返回None
+        """
+        sql = """
+        SELECT EXTRACT(EPOCH FROM MAX(time)) * 1000 AS latest_time_ms
+        FROM fills
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if row and row['latest_time_ms']:
+                return int(row['latest_time_ms'])
+            return None
+
+    async def save_user_state(self, address: str, state: Dict):
+        """
+        保存用户 Perp 账户状态快照
+
+        Args:
+            address: 用户地址
+            state: 账户状态数据（来自 user_state API）
+        """
+        if not state:
+            return
+
+        try:
+            # 提取关键字段
+            margin_summary = state.get('marginSummary', {})
+            cross_margin_summary = state.get('crossMarginSummary', {})
+            asset_positions = state.get('assetPositions', [])
+
+            sql = """
+            INSERT INTO user_states (
+                address, snapshot_time, account_value, total_margin_used,
+                total_ntl_pos, total_raw_usd, withdrawable,
+                cross_margin_summary, asset_positions
+            ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8)
+            """
+
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    sql,
+                    address,
+                    float(margin_summary.get('accountValue', 0)),
+                    float(margin_summary.get('totalMarginUsed', 0)),
+                    float(margin_summary.get('totalNtlPos', 0)),
+                    float(margin_summary.get('totalRawUsd', 0)),
+                    float(state.get('withdrawable', 0)),
+                    json.dumps(cross_margin_summary),
+                    json.dumps(asset_positions)
+                )
+            logger.info(f"保存 Perp 账户状态快照: {address}")
+
+        except Exception as e:
+            logger.error(f"保存 user_state 失败: {address} - {e}")
+
+    async def save_spot_state(self, address: str, spot_state: Dict):
+        """
+        保存用户 Spot 账户状态快照
+
+        Args:
+            address: 用户地址
+            spot_state: Spot 账户状态数据（来自 spotClearinghouseState API）
+        """
+        if not spot_state:
+            return
+
+        try:
+            # 提取 balances
+            balances = spot_state.get('balances', [])
+
+            sql = """
+            INSERT INTO spot_states (address, snapshot_time, balances)
+            VALUES ($1, NOW(), $2)
+            """
+
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    sql,
+                    address,
+                    json.dumps(balances)
+                )
+            logger.info(f"保存 Spot 账户状态快照: {address}")
+
+        except Exception as e:
+            logger.error(f"保存 spot_state 失败: {address} - {e}")
+
+    async def save_funding_history(self, address: str, funding: List[Dict]):
+        """
+        保存资金费率历史记录
+
+        Args:
+            address: 用户地址
+            funding: 资金费率记录列表（来自 user_funding_history API）
+        """
+        if not funding:
+            return
+
+        # 先查询已存在的记录，避免重复插入
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # 获取所有待插入记录的 (time, coin) 组合
+                keys = [(f.get('time'), f.get('coin')) for f in funding if f.get('time') and f.get('coin')]
+
+                if keys:
+                    # 查询已存在的记录
+                    existing = await conn.fetch(
+                        """
+                        SELECT time, coin FROM funding_history
+                        WHERE address = $1
+                        AND (time, coin) IN (SELECT unnest($2::timestamptz[]), unnest($3::varchar[]))
+                        """,
+                        address,
+                        [datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc) for k in keys],
+                        [k[1] for k in keys]
+                    )
+                    existing_keys = {(row['time'], row['coin']) for row in existing}
+                else:
+                    existing_keys = set()
+
+                # 过滤掉已存在的记录
+                records_to_insert = []
+                for record in funding:
+                    time_ms = record.get('time')
+                    coin = record.get('coin')
+
+                    if not time_ms or not coin:
+                        continue
+
+                    time_dt = datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc)
+
+                    # 检查是否已存在
+                    if (time_dt, coin) in existing_keys:
+                        continue
+
+                    records_to_insert.append((
+                        address,
+                        time_dt,
+                        coin,
+                        float(record.get('usdc', 0)),
+                        float(record.get('szi', 0)),
+                        float(record.get('fundingRate', 0))
+                    ))
+
+                # 批量插入
+                if records_to_insert:
+                    sql = """
+                    INSERT INTO funding_history (address, time, coin, usdc, szi, funding_rate)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (time, address, coin) DO NOTHING
+                    """
+                    await conn.executemany(sql, records_to_insert)
+                    logger.info(f"保存 {len(records_to_insert)} 条资金费率记录: {address} (跳过 {len(funding) - len(records_to_insert)} 条重复)")
+                else:
+                    logger.info(f"无新资金费率记录需要保存: {address}")
+
+    async def get_funding_history(self, address: str) -> List[Dict]:
+        """
+        获取地址的所有资金费率记录
+
+        Args:
+            address: 地址
+
+        Returns:
+            资金费率记录列表
+        """
+        sql = """
+        SELECT * FROM funding_history
+        WHERE address = $1
+        ORDER BY time ASC
+        """
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, address)
+            return [dict(row) for row in rows]
+
+    async def get_latest_funding_time(self, address: str) -> Optional[int]:
+        """
+        获取地址最新的资金费率时间戳（用于增量更新）
+
+        Args:
+            address: 用户地址
+
+        Returns:
+            最新资金费率的时间戳（毫秒），如果没有记录返回None
+        """
+        sql = """
+        SELECT EXTRACT(EPOCH FROM MAX(time)) * 1000 AS latest_time_ms
+        FROM funding_history
+        WHERE address = $1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if row and row['latest_time_ms']:
+                return int(row['latest_time_ms'])
+            return None
+
+    async def get_latest_user_state(self, address: str) -> Optional[Dict]:
+        """
+        获取地址最新的 Perp 账户状态
+
+        Args:
+            address: 用户地址
+
+        Returns:
+            最新账户状态
+        """
+        sql = """
+        SELECT * FROM user_states
+        WHERE address = $1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if row:
+                result = dict(row)
+                # 解析 JSONB 字段
+                if result.get('cross_margin_summary'):
+                    result['cross_margin_summary'] = json.loads(result['cross_margin_summary']) if isinstance(result['cross_margin_summary'], str) else result['cross_margin_summary']
+                if result.get('asset_positions'):
+                    result['asset_positions'] = json.loads(result['asset_positions']) if isinstance(result['asset_positions'], str) else result['asset_positions']
+                return result
+            return None
+
+    async def get_latest_spot_state(self, address: str) -> Optional[Dict]:
+        """
+        获取地址最新的 Spot 账户状态
+
+        Args:
+            address: 用户地址
+
+        Returns:
+            最新 Spot 账户状态
+        """
+        sql = """
+        SELECT * FROM spot_states
+        WHERE address = $1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+        """
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            if row:
+                result = dict(row)
+                # 解析 JSONB 字段
+                if result.get('balances'):
+                    result['balances'] = json.loads(result['balances']) if isinstance(result['balances'], str) else result['balances']
+                return result
+            return None
+
     async def save_metrics(self, address: str, metrics: Dict):
         """
         保存计算的指标
@@ -662,7 +976,6 @@ class DataStore:
         safe_metrics = {
             'total_trades': int(metrics.get('total_trades', 0)),
             'win_rate': safe_value('win_rate', 100.0, 0.0),  # DECIMAL(6, 2): 0-100
-            'roi': safe_value('roi', 9999999999.99, -9999999999.99),  # DECIMAL(12, 2)
             'sharpe_ratio': safe_value('sharpe_ratio', 999999.9999, -999999.9999),  # DECIMAL(10, 4)
             'total_pnl': safe_value('total_pnl', 999999999999.99999999, -999999999999.99999999),  # DECIMAL(20, 8)
             'account_value': safe_value('account_value', 999999999999.99999999, 0.0),  # DECIMAL(20, 8)
@@ -672,13 +985,12 @@ class DataStore:
 
         sql = """
         INSERT INTO metrics_cache (
-            address, total_trades, win_rate, roi, sharpe_ratio,
+            address, total_trades, win_rate, sharpe_ratio,
             total_pnl, account_value, max_drawdown, net_deposit, calculated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
         ON CONFLICT (address) DO UPDATE
         SET total_trades = EXCLUDED.total_trades,
             win_rate = EXCLUDED.win_rate,
-            roi = EXCLUDED.roi,
             sharpe_ratio = EXCLUDED.sharpe_ratio,
             total_pnl = EXCLUDED.total_pnl,
             account_value = EXCLUDED.account_value,
@@ -693,7 +1005,6 @@ class DataStore:
                 address,
                 safe_metrics['total_trades'],
                 safe_metrics['win_rate'],
-                safe_metrics['roi'],
                 safe_metrics['sharpe_ratio'],
                 safe_metrics['total_pnl'],
                 safe_metrics['account_value'],

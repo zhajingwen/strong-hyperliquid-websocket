@@ -27,7 +27,11 @@
       "Bash(pip3 install:*)",
       "Bash(find:*)",
       "WebFetch(domain:hyperliquid.gitbook.io)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(git log:*)",
+      "Bash(uv run:*)",
+      "Bash(grep:*)",
+      "Bash(docker exec:*)"
     ]
   }
 }

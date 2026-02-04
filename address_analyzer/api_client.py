@@ -5,6 +5,7 @@ import time
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 import aiohttp
 from aiolimiter import AsyncLimiter
@@ -126,89 +127,160 @@ class HyperliquidAPIClient:
     async def get_user_fills(
         self,
         address: str,
-        use_cache: bool = True
+        use_cache: bool = True,
+        incremental: bool = True
     ) -> List[Dict]:
         """
-        获取用户完整交易历史（支持分页）
+        获取用户完整交易历史（支持分页和增量更新）
+
+        增量更新逻辑：
+        - 如果 incremental=True，从数据库最新时间开始获取
+        - 如果 incremental=False，从0开始获取全量历史
 
         注意：user_fills() 有限制（通常2000条），需要分页获取全部历史
 
         Args:
             address: 用户地址
             use_cache: 是否使用缓存
+            incremental: 是否启用增量更新（默认True）
 
         Returns:
             交易记录列表
         """
-        # 验证地址格式
-        if not self._validate_address(address):
-            logger.error(f"无效的地址格式: {address}")
-            return []
+        try:
+            # 验证地址格式
+            if not self._validate_address(address):
+                logger.error(f"无效的地址格式: {address}")
+                return []
 
-        cache_key = f"user_fills:{address}"
+            # 增量更新：查询数据库最新时间
+            if incremental:
+                latest_time = await self.store.get_latest_fill_time(address)
+                if latest_time:
+                    # 从最新时间+1ms开始，避免重复
+                    start_time = latest_time + 1
+                    logger.info(f"[{address}] 增量更新模式: 从 {start_time} ({datetime.fromtimestamp(start_time/1000)}) 开始")
+                else:
+                    # 数据库无记录，全量获取
+                    start_time = 0
+                    logger.info(f"[{address}] 首次获取: 从 0 开始")
+            else:
+                # 全量更新模式
+                start_time = 0
+                logger.info(f"[{address}] 全量更新模式")
 
-        # 检查缓存
-        if use_cache:
-            cached = await self.store.get_api_cache(cache_key)
-            if cached:
-                self.stats['cache_hits'] += 1
-                logger.debug(f"缓存命中: {cache_key}")
-                return cached
+            # 缓存键包含增量标识
+            cache_key = f"user_fills:{address}:incremental={incremental}:start={start_time}"
 
-        all_fills = []
-        start_time = 0  # 从最早的时间开始
-        page = 0
+            # 检查缓存（增量模式通常跳过缓存）
+            if use_cache and not incremental:
+                cached = await self.store.get_api_cache(cache_key)
+                if cached:
+                    self.stats['cache_hits'] += 1
+                    logger.debug(f"缓存命中: {cache_key}")
+                    return cached
 
-        logger.info(f"[{address}] 开始获取用户成交记录...")
+            all_fills = []
+            page = 0
 
-        while True:
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    fills = self.info.user_fills_by_time(
-                        address,
-                        start_time=start_time,
-                        aggregate_by_time=True
+            logger.info(f"[{address}] 开始获取用户成交记录...")
+
+            while True:
+                try:
+                    async with self.rate_limiter:
+                        async with self.semaphore:
+                            fills = self.info.user_fills_by_time(
+                                address,
+                                start_time=start_time,
+                                aggregate_by_time=True
+                            )
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.error(
+                        f"[{address}] API 请求失败 (第 {page + 1} 页)\n"
+                        f"  异常类型: {type(e).__name__}\n"
+                        f"  异常消息: {str(e)}"
                     )
+                    break
+                except Exception as e:
+                    logger.error(
+                        f"[{address}] 获取 fills 发生未知错误 (第 {page + 1} 页)\n"
+                        f"  异常类型: {type(e).__name__}\n"
+                        f"  异常消息: {str(e)}",
+                        exc_info=True
+                    )
+                    break
 
-            # 解析响应数据
-            if not isinstance(fills, list):
-                fills = []
+                # 解析响应数据
+                if not isinstance(fills, list):
+                    logger.warning(f"[{address}] API 返回非列表数据: {type(fills).__name__}")
+                    fills = []
 
-            # 没有更多数据，退出循环
-            if not fills:
-                logger.info(f"[{address}] 已获取所有数据，共 {len(all_fills)} 条记录")
-                break
+                # 没有更多数据，退出循环
+                if not fills:
+                    logger.info(f"[{address}] 已获取所有数据，共 {len(all_fills)} 条{'新' if incremental else ''}记录")
+                    break
 
-            all_fills.extend(fills)
-            page += 1
-            logger.info(f"[{address}] 第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
+                all_fills.extend(fills)
+                page += 1
+                logger.info(f"[{address}] 第 {page} 页: {len(fills)} 条记录，累计 {len(all_fills)} 条")
 
-            # 如果返回的数据少于2000条，说明已经是最后一页
-            if len(fills) < 2000:
-                logger.info(f"[{address}] 已到达最后一页，共获取 {len(all_fills)} 条记录")
-                break
+                # 如果返回的数据少于2000条，说明已经是最后一页
+                if len(fills) < 2000:
+                    logger.info(f"[{address}] 已到达最后一页，共获取 {len(all_fills)} 条{'新' if incremental else ''}记录")
+                    break
 
-            # 使用最后一条记录（最新的）的时间戳+1作为下一次的 startTime
-            last_fill_time = fills[-1].get("time")
-            if last_fill_time is None:
-                logger.warning(f"[{address}] 无法获取最后一条记录的时间戳，停止翻页")
-                break
+                # 使用最后一条记录（最新的）的时间戳+1作为下一次的 startTime
+                try:
+                    last_fill = fills[-1]
+                    last_fill_time = last_fill.get("time")
 
-            # 加1毫秒作为下一页的起始时间，避免重复获取同一条记录
-            start_time = last_fill_time + 1
+                    if last_fill_time is None:
+                        logger.warning(
+                            f"[{address}] 最后一条记录缺少 time 字段，停止翻页\n"
+                            f"  记录数据: {last_fill}"
+                        )
+                        break
 
-            # 避免API限流，每页之间延迟500ms
-            time.sleep(0.5)
+                    # 验证时间戳格式
+                    if not isinstance(last_fill_time, (int, float)):
+                        logger.error(
+                            f"[{address}] 时间戳格式错误，停止翻页\n"
+                            f"  时间戳: {last_fill_time} (类型: {type(last_fill_time).__name__})"
+                        )
+                        break
 
-        # 更新缓存
-        if use_cache and all_fills:
-            await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
+                    # 加1毫秒作为下一页的起始时间，避免重复获取同一条记录
+                    start_time = last_fill_time + 1
 
-        return all_fills
+                except (IndexError, KeyError, TypeError) as e:
+                    logger.error(
+                        f"[{address}] 访问最后一条记录失败，停止翻页\n"
+                        f"  异常: {type(e).__name__}: {str(e)}"
+                    )
+                    break
 
-        # except Exception as e:
-            # logger.error(f"获取 user_fills 失败: {address} - {e}")
-            # return []
+                # 避免API限流，每页之间延迟500ms
+                time.sleep(0.5)
+
+            # 增量模式：直接保存到数据库（不使用缓存）
+            if incremental and all_fills:
+                await self.store.save_fills(address, all_fills)
+                logger.info(f"[{address}] 增量数据已保存: {len(all_fills)} 条新记录")
+
+            # 更新缓存（仅全量模式）
+            if use_cache and not incremental and all_fills:
+                await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
+
+            return all_fills
+
+        except Exception as e:
+            logger.error(
+                f"获取 user_fills 失败: {address}\n"
+                f"  异常类型: {type(e).__name__}\n"
+                f"  异常消息: {str(e)}",
+                exc_info=True
+            )
+            return []
 
     async def get_user_state(
         self,
@@ -250,6 +322,10 @@ class HyperliquidAPIClient:
             # 更新缓存
             if use_cache and state:
                 await self.store.set_api_cache(cache_key, state, self.cache_ttl_hours)
+
+            # 持久化到数据库
+            if state:
+                await self.store.save_user_state(address, state)
 
             return state
 
@@ -301,6 +377,10 @@ class HyperliquidAPIClient:
             if use_cache and spot_state:
                 await self.store.set_api_cache(cache_key, spot_state, self.cache_ttl_hours)
 
+            # 持久化到数据库
+            if spot_state:
+                await self.store.save_spot_state(address, spot_state)
+
             return spot_state
 
         except Exception as e:
@@ -313,10 +393,11 @@ class HyperliquidAPIClient:
         start_time: int = 0,
         end_time: Optional[int] = None,
         use_cache: bool = True,
-        enable_pagination: bool = True
+        enable_pagination: bool = True,
+        incremental: bool = True
     ) -> List[Dict]:
         """
-        获取用户资金费率历史（支持缓存和分页）
+        获取用户资金费率历史（支持缓存、分页和增量更新）
 
         支持自动分页以确保数据完整性。API 可能有返回数量限制，
         对于活跃账户需要分页查询以获取全部历史。
@@ -327,6 +408,7 @@ class HyperliquidAPIClient:
             end_time: 结束时间（毫秒时间戳），默认为None（到当前时间）
             use_cache: 是否使用缓存（默认 True）
             enable_pagination: 是否启用分页（默认 True）
+            incremental: 是否启用增量更新（默认 True）
 
         Returns:
             资金费率记录列表
@@ -336,11 +418,21 @@ class HyperliquidAPIClient:
             logger.error(f"无效的地址格式: {address}")
             return []
 
+        # 增量更新：查询数据库最新时间
+        if incremental and start_time == 0:
+            latest_time = await self.store.get_latest_funding_time(address)
+            if latest_time:
+                # 从最新时间+1ms开始，避免重复
+                start_time = latest_time + 1
+                logger.info(f"[{address}] 资金费率增量更新: 从 {start_time} ({datetime.fromtimestamp(start_time/1000)}) 开始")
+            else:
+                logger.info(f"[{address}] 资金费率首次获取: 从 0 开始")
+
         # 优化的缓存键：包含时间范围
         cache_key = f"user_funding:{address}:{start_time}:{end_time}"
 
-        # 缓存检查
-        if use_cache:
+        # 缓存检查（增量模式跳过缓存）
+        if use_cache and not incremental:
             cached = await self.store.get_api_cache(cache_key)
             if cached:
                 self.stats['cache_hits'] += 1
@@ -407,6 +499,10 @@ class HyperliquidAPIClient:
             await self.store.set_api_cache(cache_key, all_funding, self.cache_ttl_hours)
             logger.debug(f"资金费率缓存已更新: {cache_key}")
 
+        # 持久化到数据库
+        if all_funding:
+            await self.store.save_funding_history(address, all_funding)
+
         return all_funding
 
     async def _get_user_funding_single(
@@ -444,6 +540,10 @@ class HyperliquidAPIClient:
             # 更新缓存
             if use_cache and result and cache_key:
                 await self.store.set_api_cache(cache_key, result, self.cache_ttl_hours)
+
+            # 持久化到数据库
+            if result:
+                await self.store.save_funding_history(address, result)
 
             return result
 
@@ -714,26 +814,30 @@ class HyperliquidAPIClient:
     async def fetch_address_data(
         self,
         address: str,
-        save_to_db: bool = True
+        save_to_db: bool = True,
+        incremental: bool = True
     ) -> Dict[str, Any]:
         """
-        获取地址的完整数据（交易历史 + 账户状态）
+        获取地址的完整数据（支持增量更新）
 
         Args:
             address: 用户地址
             save_to_db: 是否保存到数据库
+            incremental: 是否启用增量更新（默认True）
 
         Returns:
             {
                 'fills': [...],
                 'state': {...},
-                'funding': [...]
+                'spot_state': {...},
+                'funding': [...],
+                'ledger': [...]
             }
         """
-        logger.info(f"开始获取地址数据: {address}")
+        logger.info(f"开始获取地址数据: {address} (增量模式: {incremental})")
 
         # 并发获取多个 API（包括 Spot 账户状态）
-        fills_task = self.get_user_fills(address)
+        fills_task = self.get_user_fills(address, incremental=incremental)
         state_task = self.get_user_state(address)
         spot_state_task = self.get_spot_state(address)
         funding_task = self.get_user_funding(address)
@@ -748,29 +852,65 @@ class HyperliquidAPIClient:
             return_exceptions=True
         )
 
-        # 处理异常
+        # 处理异常（改进：输出完整异常信息）
         if isinstance(fills, Exception):
-            logger.error(f"获取 fills 异常: {fills}")
+            logger.error(
+                f"获取 fills 异常:\n"
+                f"  地址: {address}\n"
+                f"  异常类型: {type(fills).__name__}\n"
+                f"  异常消息: {str(fills) or '(空消息)'}\n"
+                f"  异常详情: {repr(fills)}",
+                exc_info=fills
+            )
             fills = []
 
         if isinstance(state, Exception):
-            logger.error(f"获取 state 异常: {state}")
+            logger.error(
+                f"获取 state 异常:\n"
+                f"  地址: {address}\n"
+                f"  异常类型: {type(state).__name__}\n"
+                f"  异常消息: {str(state) or '(空消息)'}\n"
+                f"  异常详情: {repr(state)}",
+                exc_info=state
+            )
             state = None
 
         if isinstance(spot_state, Exception):
-            logger.error(f"获取 spot_state 异常: {spot_state}")
+            logger.error(
+                f"获取 spot_state 异常:\n"
+                f"  地址: {address}\n"
+                f"  异常类型: {type(spot_state).__name__}\n"
+                f"  异常消息: {str(spot_state) or '(空消息)'}\n"
+                f"  异常详情: {repr(spot_state)}",
+                exc_info=spot_state
+            )
             spot_state = None
 
         if isinstance(funding, Exception):
-            logger.error(f"获取 funding 异常: {funding}")
+            logger.error(
+                f"获取 funding 异常:\n"
+                f"  地址: {address}\n"
+                f"  异常类型: {type(funding).__name__}\n"
+                f"  异常消息: {str(funding) or '(空消息)'}\n"
+                f"  异常详情: {repr(funding)}",
+                exc_info=funding
+            )
             funding = []
 
         if isinstance(ledger, Exception):
-            logger.error(f"获取 ledger 异常: {ledger}")
+            logger.error(
+                f"获取 ledger 异常:\n"
+                f"  地址: {address}\n"
+                f"  异常类型: {type(ledger).__name__}\n"
+                f"  异常消息: {str(ledger) or '(空消息)'}\n"
+                f"  异常详情: {repr(ledger)}",
+                exc_info=ledger
+            )
             ledger = []
 
         # 保存到数据库
-        if save_to_db and fills:
+        # 注意：增量模式的 fills 已在 get_user_fills 中保存，这里只保存全量模式
+        if save_to_db and not incremental and fills:
             await self.store.save_fills(address, fills)
 
         if save_to_db and ledger:
@@ -837,44 +977,3 @@ class HyperliquidAPIClient:
             'cache_hit_rate': hits / total if total > 0 else 0,
             'api_errors': self.stats['api_errors']
         }
-
-
-async def test_api_client():
-    """测试 API 客户端"""
-    from .data_store import get_store
-
-    # 初始化数据存储
-    store = get_store()
-    await store.connect()
-
-    # 创建 API 客户端
-    client = HyperliquidAPIClient(store)
-
-    # 测试地址（从日志中提取的最活跃地址）
-    test_address = "0xc1914d36a60e299ba004bac2c9edcb973c988ef37"
-
-    # 获取数据
-    data = await client.fetch_address_data(test_address)
-
-    print(f"\n{'='*60}")
-    print(f"API 客户端测试结果")
-    print(f"{'='*60}")
-    print(f"地址: {data['address']}")
-    print(f"交易记录: {len(data['fills'])} 条")
-    print(f"账户状态: {'✓' if data['state'] else '✗'}")
-    print(f"资金费率: {len(data['funding'])} 条")
-
-    # 统计信息
-    stats = client.get_stats()
-    print(f"\nAPI 统计:")
-    print(f"  总请求数: {stats['total_requests']}")
-    print(f"  缓存命中: {stats['cache_hits']}")
-    print(f"  命中率: {stats['cache_hit_rate']:.1%}")
-    print(f"  错误次数: {stats['api_errors']}")
-
-    # 关闭连接
-    await store.close()
-
-
-if __name__ == '__main__':
-    asyncio.run(test_api_client())

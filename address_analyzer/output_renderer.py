@@ -98,40 +98,9 @@ class OutputRenderer:
             console.print()
             return
 
-        profitable = sum(1 for m in metrics_list if m.total_pnl > 0)
-        unprofitable = total_addresses - profitable
-
-        total_pnl = sum(m.total_pnl for m in metrics_list)
-        avg_win_rate = sum(m.win_rate for m in metrics_list) / total_addresses
-        avg_sharpe = sum(m.sharpe_ratio for m in metrics_list) / total_addresses
-
-        # Perp/Spot 汇总
-        total_perp = sum(m.perp_value for m in metrics_list)
-        total_spot = sum(m.spot_value for m in metrics_list)
-        total_account_value = sum(m.account_value for m in metrics_list)
-        perp_ratio = (total_perp / total_account_value * 100) if total_account_value > 0 else 0
-        spot_ratio = (total_spot / total_account_value * 100) if total_account_value > 0 else 0
-
-        # 累计收益率和年化收益率汇总
-        avg_cumulative_return = sum(m.cumulative_return for m in metrics_list) / total_addresses
-        avg_annualized_return = sum(m.annualized_return for m in metrics_list) / total_addresses
-
-        # 创建汇总面板
-        cumulative_return_color = "green" if avg_cumulative_return > 0 else "red"
-        annualized_return_color = "green" if avg_annualized_return > 0 else "red"
-
+        # 简化的汇总信息
         summary_text = f"""
 [bold]总地址数:[/bold] {total_addresses}
-[bold green]盈利地址:[/bold green] {profitable} ({profitable/total_addresses*100:.1f}%)
-[bold red]亏损地址:[/bold red] {unprofitable} ({unprofitable/total_addresses*100:.1f}%)
-[bold]总PNL:[/bold] ${total_pnl:,.2f}
-[bold]总账户价值:[/bold] ${total_account_value:,.2f}
-[bold cyan]  • Perp:[/bold cyan] ${total_perp:,.2f} ({perp_ratio:.1f}%)
-[bold yellow]  • Spot:[/bold yellow] ${total_spot:,.2f} ({spot_ratio:.1f}%)
-[bold]平均胜率:[/bold] {avg_win_rate:.1f}%
-[bold]平均夏普比率:[/bold] {avg_sharpe:.2f}
-[bold {cumulative_return_color}]平均累计收益率:[/bold {cumulative_return_color}] {avg_cumulative_return:+.1f}%
-[bold {annualized_return_color}]平均年化收益率:[/bold {annualized_return_color}] {avg_annualized_return:+.1f}%
         """
 
         panel = Panel(
@@ -164,44 +133,24 @@ class OutputRenderer:
         table.add_column("地址", style="cyan", width=44, no_wrap=False)
         table.add_column("交易数", justify="right", width=8)
         table.add_column("胜率", justify="right", width=8)
-        table.add_column("净充值", justify="right", width=12)
-        table.add_column("ROI(旧)", justify="right", width=10)
-        table.add_column("ROI(校准)", justify="right", width=10)
-        table.add_column("累计收益", justify="right", width=10)
-        table.add_column("年化收益", justify="right", width=10)
         table.add_column("夏普", justify="right", width=8)
         table.add_column("总PNL", justify="right", width=12)
         table.add_column("账户价值", justify="right", width=12)
-        table.add_column("Perp/Spot", justify="right", width=18)
         table.add_column("最大回撤", justify="right", width=10)
 
         # 添加行
         for i, metrics in enumerate(metrics_list, 1):
             # 颜色编码
             pnl_color = "green" if metrics.total_pnl > 0 else "red"
-            legacy_roi_color = "green" if metrics.roi > 0 else "red"
-            corrected_roi_color = "green" if metrics.corrected_roi > 0 else "red"
-            net_deposit_color = "green" if metrics.net_deposits >= 0 else "yellow"
-            cumulative_return_color = "green" if metrics.cumulative_return > 0 else "red"
-            annualized_return_color = "green" if metrics.annualized_return > 0 else "red"
-
-            # Perp/Spot 分解显示
-            perp_spot_display = f"[cyan]${metrics.perp_value:,.0f}[/cyan]/[yellow]${metrics.spot_value:,.0f}[/yellow]"
 
             table.add_row(
                 str(i),
                 metrics.address,
                 str(metrics.total_trades),
                 f"{metrics.win_rate:.1f}%",
-                f"[{net_deposit_color}]${metrics.net_deposits:,.0f}[/{net_deposit_color}]",
-                f"[{legacy_roi_color}]{metrics.roi:+.1f}%[/{legacy_roi_color}]",
-                f"[{corrected_roi_color}]{metrics.corrected_roi:+.1f}%[/{corrected_roi_color}]",
-                f"[{cumulative_return_color}]{metrics.cumulative_return:+.1f}%[/{cumulative_return_color}]",
-                f"[{annualized_return_color}]{metrics.annualized_return:+.1f}%[/{annualized_return_color}]",
                 f"{metrics.sharpe_ratio:.2f}",
                 f"[{pnl_color}]${metrics.total_pnl:,.0f}[/{pnl_color}]",
                 f"${metrics.account_value:,.0f}",
-                perp_spot_display,
                 f"{metrics.max_drawdown:.1f}%"
             )
 
@@ -226,24 +175,6 @@ class OutputRenderer:
             reverse=True
         )
 
-        # 准备数据
-        profitable = sum(1 for m in metrics_list if m.total_pnl > 0)
-        unprofitable = len(metrics_list) - profitable
-        total_pnl = sum(m.total_pnl for m in metrics_list)
-        avg_win_rate = sum(m.win_rate for m in metrics_list) / len(metrics_list) if metrics_list else 0
-        avg_sharpe = sum(m.sharpe_ratio for m in metrics_list) / len(metrics_list) if metrics_list else 0
-
-        # Perp/Spot 汇总数据
-        total_perp = sum(m.perp_value for m in metrics_list)
-        total_spot = sum(m.spot_value for m in metrics_list)
-        total_account_value = sum(m.account_value for m in metrics_list)
-        perp_ratio = (total_perp / total_account_value * 100) if total_account_value > 0 else 0
-        spot_ratio = (total_spot / total_account_value * 100) if total_account_value > 0 else 0
-
-        # 累计收益率和年化收益率汇总
-        avg_cumulative_return = sum(m.cumulative_return for m in metrics_list) / len(metrics_list) if metrics_list else 0
-        avg_annualized_return = sum(m.annualized_return for m in metrics_list) / len(metrics_list) if metrics_list else 0
-
         # HTML模板
         template_str = """
 <!DOCTYPE html>
@@ -252,7 +183,6 @@ class OutputRenderer:
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Hyperliquid 交易地址分析报告</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -267,34 +197,6 @@ class OutputRenderer:
             color: #00d4ff;
             margin-bottom: 30px;
             font-size: 2.5em;
-        }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .stat-card {
-            background: #1a1f2e;
-            padding: 20px;
-            border-radius: 10px;
-            border: 1px solid #2a3f5f;
-        }
-        .stat-label { color: #8899a6; font-size: 0.9em; margin-bottom: 5px; }
-        .stat-value { font-size: 2em; font-weight: bold; color: #00d4ff; }
-        .stat-value.green { color: #00ff88; }
-        .stat-value.red { color: #ff4444; }
-        .charts-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .chart-container {
-            background: #1a1f2e;
-            padding: 20px;
-            border-radius: 10px;
-            border: 1px solid #2a3f5f;
         }
         table {
             width: 100%;
@@ -333,79 +235,6 @@ class OutputRenderer:
     <div class="container">
         <h1>🔍 Hyperliquid 交易地址分析报告</h1>
 
-        <!-- 汇总统计 -->
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">总地址数</div>
-                <div class="stat-value">{{ total_addresses }}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">盈利地址</div>
-                <div class="stat-value green">{{ profitable }} ({{ (profitable/total_addresses*100)|round(1) }}%)</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">亏损地址</div>
-                <div class="stat-value red">{{ unprofitable }} ({{ (unprofitable/total_addresses*100)|round(1) }}%)</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">总PNL</div>
-                <div class="stat-value {% if total_pnl > 0 %}green{% else %}red{% endif %}">
-                    ${{ "{:,.0f}".format(total_pnl) }}
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">总账户价值</div>
-                <div class="stat-value">${{ "{:,.0f}".format(total_account_value) }}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">总 Perp 价值</div>
-                <div class="stat-value" style="color: #00d4ff;">
-                    ${{ "{:,.0f}".format(total_perp) }}
-                    <div style="font-size: 0.5em; color: #8899a6;">({{ perp_ratio|round(1) }}%)</div>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">总 Spot 价值</div>
-                <div class="stat-value" style="color: #ff9900;">
-                    ${{ "{:,.0f}".format(total_spot) }}
-                    <div style="font-size: 0.5em; color: #8899a6;">({{ spot_ratio|round(1) }}%)</div>
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">平均胜率</div>
-                <div class="stat-value">{{ avg_win_rate|round(1) }}%</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">平均夏普比率</div>
-                <div class="stat-value">{{ avg_sharpe|round(2) }}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">平均累计收益率</div>
-                <div class="stat-value {% if avg_cumulative_return > 0 %}green{% else %}red{% endif %}">
-                    {{ avg_cumulative_return|round(1) }}%
-                </div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">平均年化收益率</div>
-                <div class="stat-value {% if avg_annualized_return > 0 %}green{% else %}red{% endif %}">
-                    {{ avg_annualized_return|round(1) }}%
-                </div>
-            </div>
-        </div>
-
-        <!-- 图表 -->
-        <div class="charts-grid">
-            <div class="chart-container">
-                <canvas id="perpSpotChart"></canvas>
-            </div>
-            <div class="chart-container">
-                <canvas id="winRateChart"></canvas>
-            </div>
-            <div class="chart-container">
-                <canvas id="pnlChart"></canvas>
-            </div>
-        </div>
-
         <!-- 详细表格 -->
         <table>
             <thead>
@@ -414,17 +243,9 @@ class OutputRenderer:
                     <th>地址</th>
                     <th>交易数</th>
                     <th>胜率</th>
-                    <th>净充值</th>
-                    <th>ROI(推算)</th>
-                    <th>ROI(校准)</th>
-                    <th>累计收益率</th>
-                    <th>年化收益率</th>
                     <th>夏普比率</th>
                     <th>总PNL</th>
                     <th>账户价值</th>
-                    <th>Perp 价值</th>
-                    <th>Spot 价值</th>
-                    <th>Perp 占比</th>
                     <th>最大回撤</th>
                 </tr>
             </thead>
@@ -435,29 +256,11 @@ class OutputRenderer:
                     <td class="address">{{ m.address }}</td>
                     <td>{{ m.total_trades }}</td>
                     <td>{{ m.win_rate|round(1) }}%</td>
-                    <td class="{% if m.net_deposits >= 0 %}positive{% else %}negative{% endif %}">
-                        ${{ "{:,.0f}".format(m.net_deposits) }}
-                    </td>
-                    <td class="{% if m.roi > 0 %}positive{% else %}negative{% endif %}">
-                        {{ m.roi|round(1) }}%
-                    </td>
-                    <td class="{% if m.corrected_roi > 0 %}positive{% else %}negative{% endif %}">
-                        {{ m.corrected_roi|round(1) }}%
-                    </td>
-                    <td class="{% if m.cumulative_return > 0 %}positive{% else %}negative{% endif %}">
-                        {{ m.cumulative_return|round(1) }}%
-                    </td>
-                    <td class="{% if m.annualized_return > 0 %}positive{% else %}negative{% endif %}">
-                        {{ m.annualized_return|round(1) }}%
-                    </td>
                     <td>{{ m.sharpe_ratio|round(2) }}</td>
                     <td class="{% if m.total_pnl > 0 %}positive{% else %}negative{% endif %}">
                         ${{ "{:,.0f}".format(m.total_pnl) }}
                     </td>
                     <td>${{ "{:,.0f}".format(m.account_value) }}</td>
-                    <td style="color: #00d4ff;">${{ "{:,.0f}".format(m.perp_value) }}</td>
-                    <td style="color: #ff9900;">${{ "{:,.0f}".format(m.spot_value) }}</td>
-                    <td>{{ (m.perp_value / m.account_value * 100)|round(1) if m.account_value > 0 else 0 }}%</td>
                     <td>{{ m.max_drawdown|round(1) }}%</td>
                 </tr>
                 {% endfor %}
@@ -469,130 +272,14 @@ class OutputRenderer:
             数据来源: Hyperliquid API
         </div>
     </div>
-
-    <script>
-        // Perp vs Spot 资金分布饼图
-        new Chart(document.getElementById('perpSpotChart'), {
-            type: 'pie',
-            data: {
-                labels: ['Perp', 'Spot'],
-                datasets: [{
-                    data: [{{ total_perp }}, {{ total_spot }}],
-                    backgroundColor: ['#00d4ff', '#ff9900'],
-                    borderColor: '#1a1f2e',
-                    borderWidth: 2
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    title: {
-                        display: true,
-                        text: 'Perp vs Spot 资金分布',
-                        color: '#e0e0e0',
-                        font: { size: 16 }
-                    },
-                    legend: {
-                        labels: { color: '#e0e0e0', font: { size: 14 } },
-                        position: 'bottom'
-                    },
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                const label = context.label || '';
-                                const value = context.parsed || 0;
-                                const total = {{ total_perp }} + {{ total_spot }};
-                                const percentage = ((value / total) * 100).toFixed(1);
-                                return label + ': $' + value.toLocaleString() + ' (' + percentage + '%)';
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // 胜率分布直方图
-        const winRateData = {{ win_rates|tojson }};
-        new Chart(document.getElementById('winRateChart'), {
-            type: 'bar',
-            data: {
-                labels: ['0-20%', '20-40%', '40-60%', '60-80%', '80-100%'],
-                datasets: [{
-                    label: '地址数量',
-                    data: [
-                        winRateData.filter(x => x < 20).length,
-                        winRateData.filter(x => x >= 20 && x < 40).length,
-                        winRateData.filter(x => x >= 40 && x < 60).length,
-                        winRateData.filter(x => x >= 60 && x < 80).length,
-                        winRateData.filter(x => x >= 80).length,
-                    ],
-                    backgroundColor: '#00d4ff',
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    title: { display: true, text: '胜率分布', color: '#e0e0e0' },
-                    legend: { labels: { color: '#e0e0e0' } }
-                },
-                scales: {
-                    x: { ticks: { color: '#e0e0e0' } },
-                    y: { ticks: { color: '#e0e0e0' } }
-                }
-            }
-        });
-
-        // PNL分布图
-        const pnlData = {{ pnls|tojson }};
-        new Chart(document.getElementById('pnlChart'), {
-            type: 'scatter',
-            data: {
-                datasets: [{
-                    label: 'PNL 分布',
-                    data: pnlData.map((pnl, i) => ({x: i, y: pnl})),
-                    backgroundColor: pnlData.map(pnl => pnl > 0 ? '#00ff88' : '#ff4444'),
-                }]
-            },
-            options: {
-                responsive: true,
-                plugins: {
-                    title: { display: true, text: 'PNL 分布', color: '#e0e0e0' },
-                    legend: { labels: { color: '#e0e0e0' } }
-                },
-                scales: {
-                    x: { ticks: { color: '#e0e0e0' }, title: { display: true, text: '地址索引', color: '#e0e0e0' } },
-                    y: { ticks: { color: '#e0e0e0' }, title: { display: true, text: 'PNL (USD)', color: '#e0e0e0' } }
-                }
-            }
-        });
-    </script>
 </body>
 </html>
         """
 
-        # 准备图表数据
-        win_rates = [m.win_rate for m in sorted_metrics]
-        pnls = [m.total_pnl for m in sorted_metrics]
-
         # 渲染模板
         template = Template(template_str)
         html_content = template.render(
-            total_addresses=len(metrics_list),
-            profitable=profitable,
-            unprofitable=unprofitable,
-            total_pnl=total_pnl,
-            avg_win_rate=avg_win_rate,
-            avg_sharpe=avg_sharpe,
-            total_perp=total_perp,
-            total_spot=total_spot,
-            total_account_value=total_account_value,
-            perp_ratio=perp_ratio,
-            spot_ratio=spot_ratio,
-            avg_cumulative_return=avg_cumulative_return,
-            avg_annualized_return=avg_annualized_return,
             metrics=sorted_metrics,
-            win_rates=win_rates,
-            pnls=pnls,
             timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         )
 
@@ -603,39 +290,3 @@ class OutputRenderer:
 
         logger.info(f"HTML报告已生成: {output_path}")
         self.console.print(f"\n✅ HTML报告已生成: [cyan]{output_path}[/cyan]")
-
-
-def test_renderer():
-    """测试渲染器"""
-    # 模拟数据
-    test_metrics = [
-        AddressMetrics(
-            address=f"0xtest{i:040x}",
-            total_trades=100 + i * 10,
-            win_rate=50 + i * 2,
-            roi=10 + i * 5,
-            sharpe_ratio=1.5 + i * 0.1,
-            total_pnl=1000 + i * 500,
-            account_value=10000 + i * 1000,
-            max_drawdown=20 - i,
-            avg_trade_size=5000,
-            total_volume=500000 + i * 10000,
-            first_trade_time=1704067200000,
-            last_trade_time=1704326400000,
-            active_days=30 + i
-        )
-        for i in range(10)
-    ]
-
-    renderer = OutputRenderer()
-
-    # 渲染终端输出
-    renderer.render_terminal(test_metrics, top_n=10)
-
-    # 渲染HTML报告
-    renderer.render_html(test_metrics, "output/test_report.html")
-
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    test_renderer()
