@@ -7,12 +7,19 @@
 **数据库**: PostgreSQL 14+ with TimescaleDB Extension
 **字符集**: UTF-8
 **时区**: UTC
-**最后更新**: 2026-02-04
+**最后更新**: 2026-02-05
 **表总数**: 11 张
 
 ---
 
 ## 📝 变更历史
+
+### 2026-02-05 - fills 表添加 liquidation 字段
+- 🆕 **新增** `fills.liquidation` 字段（JSONB 类型）
+- ✅ **修复** 爆仓检测功能：从数据库读取时也能正确检测强平记录
+- 📄 **原因**: 原 `save_fills()` 未存储 `liquidation` 字段，导致从缓存读取时爆仓检测失败
+- 🔧 **效果**: 爆仓检测结果稳定一致（无论数据来源是 API 还是数据库）
+- 📊 **迁移**: 执行 `migrations/002_add_liquidation_field.sql` 或运行 `fix_liquidation.py`
 
 ### 2026-02-04 - 数据新鲜度跟踪表
 - 🆕 **新增** `data_freshness` 表（数据新鲜度跟踪）
@@ -151,6 +158,7 @@ CREATE TABLE fills (
     closed_pnl DECIMAL(20, 8),                 -- 已实现盈亏
     fee DECIMAL(20, 8),                        -- 手续费
     hash VARCHAR(66),                          -- 交易哈希
+    liquidation JSONB,                         -- 强平信息(爆仓时有值) 🆕
     PRIMARY KEY (time, address, hash),
     CONSTRAINT chk_fills_side CHECK (side IN ('L', 'S')),
     CONSTRAINT chk_fills_price CHECK (price > 0),
@@ -163,9 +171,15 @@ SELECT create_hypertable('fills', 'time',
     if_not_exists => TRUE
 );
 
+-- 爆仓记录索引(可选,用于快速查询强平记录)
+CREATE INDEX IF NOT EXISTS idx_fills_liquidation
+ON fills ((liquidation IS NOT NULL))
+WHERE liquidation IS NOT NULL;
+
 COMMENT ON TABLE fills IS '交易成交记录表(按7天分区)';
 COMMENT ON COLUMN fills.side IS 'L=做多Long, S=做空Short';
 COMMENT ON COLUMN fills.closed_pnl IS '平仓盈亏(仅平仓时有值)';
+COMMENT ON COLUMN fills.liquidation IS '强平信息JSON(爆仓时有值,包含liquidatedUser/markPx/method)';
 ```
 
 **字段详解**:
@@ -181,6 +195,27 @@ COMMENT ON COLUMN fills.closed_pnl IS '平仓盈亏(仅平仓时有值)';
 | `closed_pnl` | DECIMAL(20,8) | - | 已实现盈亏(USDC) | `123.45678900` |
 | `fee` | DECIMAL(20,8) | - | 手续费(USDC) | `3.39117284` |
 | `hash` | VARCHAR(66) | PK | 交易哈希(0x+64位) | `0xabcd1234...` |
+| `liquidation` 🆕 | JSONB | - | 强平信息(爆仓时有值) | `{"liquidatedUser": "0x...", "markPx": "214.04", "method": "market"}` |
+
+**liquidation 字段详解** 🆕:
+
+当交易为强制平仓（爆仓）时，`liquidation` 字段包含以下信息：
+
+| 子字段 | 类型 | 说明 | 示例值 |
+|--------|------|------|--------|
+| `liquidatedUser` | string | 被清算用户地址 | `0x324f74880ccee9a05282614d3f80c09831a36774` |
+| `markPx` | string | 触发清算时的标记价格 | `214.04` |
+| `method` | string | 清算方式 | `market` (市价清算) |
+
+**爆仓检测逻辑**:
+
+```python
+# 检测爆仓记录
+liquidations = [f for f in fills if f.get('liquidation')]
+if liquidations:
+    total_loss = sum(float(f.get('closed_pnl', 0)) for f in liquidations)
+    print(f"发现 {len(liquidations)} 笔爆仓，总损失: ${total_loss:,.2f}")
+```
 
 **索引**:
 
@@ -255,6 +290,45 @@ WHERE address = '0x162cc7c861ebd0c06b3d72319201150482518185'
   AND time >= NOW() - INTERVAL '30 days'
 GROUP BY day
 ORDER BY day DESC;
+
+-- 4. 查询爆仓记录 🆕
+SELECT
+    time,
+    coin,
+    side,
+    price,
+    size,
+    closed_pnl,
+    liquidation->>'liquidatedUser' AS liquidated_user,
+    liquidation->>'markPx' AS mark_price,
+    liquidation->>'method' AS liquidation_method
+FROM fills
+WHERE address = '0x162cc7c861ebd0c06b3d72319201150482518185'
+  AND liquidation IS NOT NULL
+ORDER BY time DESC;
+
+-- 5. 统计爆仓汇总 🆕
+SELECT
+    address,
+    COUNT(*) AS liquidation_count,
+    SUM(closed_pnl) AS total_liquidation_loss,
+    COUNT(DISTINCT coin) AS affected_coins
+FROM fills
+WHERE liquidation IS NOT NULL
+GROUP BY address
+ORDER BY total_liquidation_loss ASC;
+
+-- 6. 按币种统计爆仓 🆕
+SELECT
+    coin,
+    COUNT(*) AS liquidation_count,
+    SUM(closed_pnl) AS total_loss,
+    AVG(closed_pnl) AS avg_loss_per_liquidation
+FROM fills
+WHERE address = '0x162cc7c861ebd0c06b3d72319201150482518185'
+  AND liquidation IS NOT NULL
+GROUP BY coin
+ORDER BY total_loss ASC;
 ```
 
 **数据来源**: Hyperliquid API `user_fills()`
@@ -1834,6 +1908,12 @@ REFRESH MATERIALIZED VIEW daily_funding_summary;
 
 ## 📝 变更日志
 
+### v3.1 (2026-02-05)
+- 🆕 新增: `fills.liquidation` 字段（JSONB 类型，存储强平信息）
+- ✅ 修复: 爆仓检测功能，从数据库读取时也能正确检测
+- 📊 新增: 爆仓相关查询示例
+- 🔧 迁移: `migrations/002_add_liquidation_field.sql`
+
 ### v3.0 (2026-02-04)
 - 🆕 新增: `data_freshness` 表（数据新鲜度跟踪）
 - 🆕 新增: `user_states` 表（Perp账户状态快照）
@@ -1854,8 +1934,8 @@ REFRESH MATERIALIZED VIEW daily_funding_summary;
 
 ---
 
-**文档版本**: v3.0
-**最后更新**: 2026-02-04
+**文档版本**: v3.1
+**最后更新**: 2026-02-05
 **包含表数**: 11张
 **数据库**: PostgreSQL 14+ with TimescaleDB 2.0+
 **代码对应**: `address_analyzer/data_store.py`

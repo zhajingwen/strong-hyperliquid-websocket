@@ -87,8 +87,20 @@ class DataStore:
             closed_pnl DECIMAL(20, 8),
             fee DECIMAL(20, 8),
             hash VARCHAR(66),
+            liquidation JSONB,
             PRIMARY KEY (time, address, hash)
         );
+
+        -- 为已有表添加 liquidation 字段（如果不存在）
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'fills' AND column_name = 'liquidation'
+            ) THEN
+                ALTER TABLE fills ADD COLUMN liquidation JSONB;
+            END IF;
+        END $$;
 
         -- 3. 转账记录表
         CREATE TABLE IF NOT EXISTS transfers (
@@ -468,6 +480,10 @@ class DataStore:
                 for fill in fills:
                     fill_hash = fill.get('hash')
                     if not fill_hash or fill_hash not in existing_hash_set:
+                        # 处理 liquidation 字段（可能是 dict 或 None）
+                        liquidation_data = fill.get('liquidation')
+                        liquidation_json = json.dumps(liquidation_data) if liquidation_data else None
+
                         records_to_insert.append((
                             address,
                             datetime.fromtimestamp(fill['time'] / 1000),  # 毫秒转秒
@@ -477,14 +493,15 @@ class DataStore:
                             float(fill.get('sz', 0)),
                             float(fill.get('closedPnl', 0)),
                             float(fill.get('fee', 0)),
-                            fill_hash
+                            fill_hash,
+                            liquidation_json
                         ))
 
                 # 批量插入
                 if records_to_insert:
                     sql = """
-                    INSERT INTO fills (address, time, coin, side, price, size, closed_pnl, fee, hash)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    INSERT INTO fills (address, time, coin, side, price, size, closed_pnl, fee, hash, liquidation)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                     """
                     await conn.executemany(sql, records_to_insert)
                     logger.info(f"保存 {len(records_to_insert)} 条交易记录: {address} (跳过 {len(fills) - len(records_to_insert)} 条重复)")
