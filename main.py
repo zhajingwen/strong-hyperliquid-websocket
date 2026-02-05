@@ -175,8 +175,12 @@ def safe_print(msg: Any) -> None:
                 size = float(trade.get('sz', 0))
                 tid = trade.get('tid', 'N/A')
                 # 过滤做市商订单
-                if size < 1000:
-                    continue
+                if coin == 'xyz:SNDK':
+                    if size < 0.08:
+                        continue
+                if coin == 'PURR':
+                    if size < 1000:
+                        continue
                 if tid in tids:
                     continue
                 tids.append(tid)
