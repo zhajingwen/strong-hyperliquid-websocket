@@ -34,7 +34,41 @@ from enhanced_ws_manager import (
 
 # API 端点
 BASE_URL = constants.MAINNET_API_URL
-tids = []
+
+# ==================== 去重管理 ====================
+# 使用有限大小的集合进行去重，防止内存泄漏
+class DeduplicationCache:
+    """
+    去重缓存 - 使用有限大小的集合避免内存泄漏
+    重连后自动保留已打印的记录，跳过重复消息
+    """
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
+        self._cache: set = set()
+        self._order: list = []  # 保持插入顺序，用于淘汰最旧的
+
+    def contains(self, key: str) -> bool:
+        """检查是否已存在"""
+        return key in self._cache
+
+    def add(self, key: str) -> None:
+        """添加到缓存"""
+        if key in self._cache:
+            return
+        # 如果缓存已满，移除最旧的元素
+        if len(self._cache) >= self.max_size:
+            oldest = self._order.pop(0)
+            self._cache.discard(oldest)
+        self._cache.add(key)
+        self._order.append(key)
+
+    def size(self) -> int:
+        """返回当前缓存大小"""
+        return len(self._cache)
+
+# 去重缓存实例
+printed_trades = DeduplicationCache(max_size=10000)  # 交易去重
+printed_l2books = DeduplicationCache(max_size=1000)  # 订单簿去重（基于时间戳）
 # 订阅列表
 SUBSCRIPTIONS = [
     # 高频数据（用于假活检测）
@@ -181,9 +215,10 @@ def safe_print(msg: Any) -> None:
                 if coin == 'PURR':
                     if size < 1000:
                         continue
-                if tid in tids:
+                # 去重检查：跳过已打印的交易
+                if printed_trades.contains(tid):
                     continue
-                tids.append(tid)
+                printed_trades.add(tid)
                 volume = price * size
 
                 timestamp = trade.get('time', 0)
@@ -247,6 +282,13 @@ def safe_print(msg: Any) -> None:
             data = msg.get("data", {})
             coin = data.get("coin", "N/A")
             timestamp = data.get("time", 0)
+
+            # 去重检查：基于币种+时间戳，跳过已打印的订单簿快照
+            l2book_key = f"{coin}:{timestamp}"
+            if printed_l2books.contains(l2book_key):
+                return
+            printed_l2books.add(l2book_key)
+
             time_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
             levels = data.get("levels", [[], []])
