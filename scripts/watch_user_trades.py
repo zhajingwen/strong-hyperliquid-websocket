@@ -31,6 +31,44 @@ from hyperliquid.utils import constants
 from enhanced_ws_manager import EnhancedWebSocketManager, ConnectionState
 
 
+# ==================== 去重管理 ====================
+# 使用有限大小的集合进行去重，防止内存泄漏
+class DeduplicationCache:
+    """
+    去重缓存 - 使用有限大小的集合避免内存泄漏
+    重连后自动保留已打印的记录，跳过重复消息
+    """
+    def __init__(self, max_size: int = 10000):
+        self.max_size = max_size
+        self._cache: set = set()
+        self._order: list = []  # 保持插入顺序，用于淘汰最旧的
+
+    def contains(self, key: str) -> bool:
+        """检查是否已存在"""
+        return key in self._cache
+
+    def add(self, key: str) -> None:
+        """添加到缓存"""
+        if key in self._cache:
+            return
+        # 如果缓存已满，移除最旧的元素
+        if len(self._cache) >= self.max_size:
+            oldest = self._order.pop(0)
+            self._cache.discard(oldest)
+        self._cache.add(key)
+        self._order.append(key)
+
+    def size(self) -> int:
+        """返回当前缓存大小"""
+        return len(self._cache)
+
+
+# 去重缓存实例
+printed_fills = DeduplicationCache(max_size=10000)      # 成交去重 (基于 tid)
+printed_orders = DeduplicationCache(max_size=5000)      # 订单更新去重 (基于 oid+status+timestamp)
+printed_events = DeduplicationCache(max_size=5000)      # 用户事件去重
+
+
 # ==================== 多连接池管理器 ====================
 
 class MultiConnectionManager:
@@ -440,6 +478,28 @@ def handle_user_events(data: Any, user: str = "") -> None:
         logging.debug(f"跳过无用户信息的用户事件: {data}")
         return
 
+    # 去重处理：构建事件唯一标识
+    if isinstance(data, dict):
+        # 提取关键信息构建去重键
+        fills = data.get("fills", [])
+        funding = data.get("funding", {})
+        liquidation = data.get("liquidation", {})
+        non_user_cancel = data.get("nonUserCancel", [])
+
+        # 构建去重键：用户 + fills的tid列表 + funding/liquidation内容
+        fill_tids = sorted([f.get("tid", "") for f in fills if f.get("tid")])
+        event_key = f"{user}:fills={','.join(fill_tids)}:funding={bool(funding)}:liq={bool(liquidation)}:cancel={len(non_user_cancel)}"
+
+        if printed_events.contains(event_key):
+            return
+        printed_events.add(event_key)
+    else:
+        # 非字典数据，用字符串表示去重
+        event_key = f"{user}:{str(data)[:100]}"
+        if printed_events.contains(event_key):
+            return
+        printed_events.add(event_key)
+
     addr_display = format_address(user)
     addr_idx = get_address_index(user)
     idx_tag = f"[#{addr_idx}]" if addr_idx > 0 else ""
@@ -450,12 +510,7 @@ def handle_user_events(data: Any, user: str = "") -> None:
     print("═" * 100)
 
     if isinstance(data, dict):
-        # 检查各类事件
-        fills = data.get("fills", [])
-        funding = data.get("funding", {})
-        liquidation = data.get("liquidation", {})
-        non_user_cancel = data.get("nonUserCancel", [])
-
+        # 变量已在上方提取，直接使用
         if fills:
             print(f"\n🔸 成交事件 ({len(fills)} 笔):")
             for fill in fills:
@@ -492,7 +547,19 @@ def handle_user_fills(data: Any) -> None:
 
     if not fills:
         return
-    fills = fills[-1:]
+
+    # 去重过滤：跳过已打印的成交记录
+    new_fills = []
+    for fill in fills:
+        tid = fill.get("tid", "")
+        if tid and not printed_fills.contains(tid):
+            printed_fills.add(tid)
+            new_fills.append(fill)
+
+    if not new_fills:
+        return
+
+    fills = new_fills[-1:]  # 只显示最新一条
     # 获取地址编号和格式化显示
     addr_idx = get_address_index(user)
     addr_display = format_address(user)
@@ -637,6 +704,31 @@ def handle_order_updates(data: Any, user: str = "") -> None:
 
     if not orders:
         return
+
+    # 去重过滤：基于 oid + status + statusTimestamp 去重
+    new_orders = []
+    for order_data in orders:
+        # 提取订单信息
+        if "order" in order_data:
+            order = order_data.get("order", {})
+            status = order_data.get("status", order.get("status", ""))
+            status_ts = order_data.get("statusTimestamp", order.get("statusTimestamp", 0))
+        else:
+            order = order_data
+            status = order.get("status", "")
+            status_ts = order.get("statusTimestamp", 0)
+
+        oid = order.get("oid", "")
+        # 构建去重键
+        dedup_key = f"{oid}:{status}:{status_ts}"
+        if dedup_key and not printed_orders.contains(dedup_key):
+            printed_orders.add(dedup_key)
+            new_orders.append(order_data)
+
+    if not new_orders:
+        return
+
+    orders = new_orders
 
     # 如果没有用户信息，跳过打印（过滤无效消息）
     if not user:
