@@ -33,7 +33,8 @@
       "Bash(grep:*)",
       "Bash(docker exec:*)",
       "Bash(vulture:*)",
-      "Bash(uv pip install:*)"
+      "Bash(uv pip install:*)",
+      "Bash(curl:*)"
     ]
   }
 }

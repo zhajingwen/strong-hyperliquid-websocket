@@ -43,8 +43,8 @@ SUBSCRIPTIONS = [
     # 市场数据
     # {"type": "l2Book", "coin": "PURR"},
     # {"type": "trades", "coin": "PURR"},
-    # {"type": "l2Book", "coin": "SNDK"},                                                                                               
-    {"type": "trades", "coin": "SNDK"},      
+    {"type": "l2Book", "coin": "xyz:SNDK"},
+    # {"type": "trades", "coin": "SNDK"},      
     # {"type": "candle", "coin": "PURR", "interval": "5m"},
     # {"type": "bbo", "coin": "ETH"},
 
