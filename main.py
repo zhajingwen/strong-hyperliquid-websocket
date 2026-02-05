@@ -43,7 +43,8 @@ SUBSCRIPTIONS = [
     # 市场数据
     # {"type": "l2Book", "coin": "PURR"},
     # {"type": "trades", "coin": "PURR"},
-    {"type": "l2Book", "coin": "xyz:SNDK"},
+    # {"type": "l2Book", "coin": "xyz:SNDK"},
+    {"type": "trades", "coin": "xyz:SNDK"},
     # {"type": "trades", "coin": "SNDK"},      
     # {"type": "candle", "coin": "PURR", "interval": "5m"},
     # {"type": "bbo", "coin": "ETH"},
@@ -422,6 +423,15 @@ def safe_print(msg: Any) -> None:
             # 订单更新
             data = msg.get("data", [])
             print(f"[orderUpdates] 收到 {len(data)} 个订单更新")
+
+        elif channel == "error":
+            # 错误消息 - 过滤预期的错误
+            data = msg.get("data", "")
+            # "Already unsubscribed" 是保底清理机制的预期响应，忽略
+            if "Already unsubscribed" in data:
+                return
+            # 其他错误正常打印
+            print(f"[error] {data}")
 
         else:
             # 其他消息类型
