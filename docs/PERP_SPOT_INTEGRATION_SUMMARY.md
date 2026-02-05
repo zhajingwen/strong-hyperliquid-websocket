@@ -125,11 +125,11 @@ spot_value=spot_value,
 
 **变更**：
 ```python
-# 获取账户状态（从缓存）
-state = await self.store.get_api_cache(f"user_state:{addr}")
+# 获取账户状态（从专用数据表）
+state = await self.store.get_latest_user_state(addr)
 
-# 获取 Spot 账户状态（从缓存）
-spot_state = await self.store.get_api_cache(f"spot_state:{addr}")
+# 获取 Spot 账户状态（从专用数据表）
+spot_state = await self.store.get_latest_spot_state(addr)
 
 # 计算指标（传入新参数，包括 spot_state）
 metrics = self.metrics_engine.calculate_metrics(

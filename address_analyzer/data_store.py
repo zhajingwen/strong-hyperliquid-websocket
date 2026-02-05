@@ -136,15 +136,7 @@ class DataStore:
             calculated_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- 6. API缓存表
-        CREATE TABLE IF NOT EXISTS api_cache (
-            cache_key VARCHAR(255) PRIMARY KEY,
-            response_data JSONB,
-            cached_at TIMESTAMPTZ DEFAULT NOW(),
-            expires_at TIMESTAMPTZ
-        );
-
-        -- 7. 处理状态表
+        -- 6. 处理状态表
         CREATE TABLE IF NOT EXISTS processing_status (
             address VARCHAR(42) PRIMARY KEY,
             status VARCHAR(20),
@@ -199,7 +191,6 @@ class DataStore:
         -- 索引优化
         CREATE INDEX IF NOT EXISTS idx_fills_address_time ON fills(address, time DESC);
         CREATE INDEX IF NOT EXISTS idx_transfers_address_time ON transfers(address, time DESC);
-        CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at);
         CREATE INDEX IF NOT EXISTS idx_processing_status ON processing_status(status, retry_count);
         CREATE INDEX IF NOT EXISTS idx_user_states_address_time ON user_states(address, snapshot_time DESC);
         CREATE INDEX IF NOT EXISTS idx_spot_states_address_time ON spot_states(address, snapshot_time DESC);
@@ -378,75 +369,6 @@ class DataStore:
 
         async with self.pool.acquire() as conn:
             await conn.execute(sql, address)
-
-    async def get_api_cache(self, cache_key: str) -> Optional[Dict]:
-        """
-        获取API缓存
-
-        Args:
-            cache_key: 缓存键
-
-        Returns:
-            缓存数据或None
-        """
-        sql = """
-        SELECT response_data FROM api_cache
-        WHERE cache_key = $1
-          AND expires_at > NOW()
-        """
-
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(sql, cache_key)
-            if not row:
-                return None
-
-            # asyncpg 返回 JSONB 数据，如果是字符串则需要再次解析
-            data = row['response_data']
-            if isinstance(data, str):
-                return json.loads(data)
-            return data
-
-    async def set_api_cache(
-        self,
-        cache_key: str,
-        data: Dict,
-        ttl_hours: int = 1
-    ):
-        """
-        设置API缓存
-
-        Args:
-            cache_key: 缓存键
-            data: 缓存数据
-            ttl_hours: 过期时间（小时）
-        """
-        sql = """
-        INSERT INTO api_cache (cache_key, response_data, expires_at)
-        VALUES ($1, $2, NOW() + $3::INTERVAL)
-        ON CONFLICT (cache_key) DO UPDATE
-        SET response_data = EXCLUDED.response_data,
-            cached_at = NOW(),
-            expires_at = NOW() + $3::INTERVAL
-        """
-
-        async with self.pool.acquire() as conn:
-            # 转换为JSON字符串，asyncpg 会将其存储为 JSONB
-            await conn.execute(sql, cache_key, json.dumps(data), timedelta(hours=ttl_hours))
-
-    async def delete_api_cache(self, cache_key: str):
-        """
-        删除指定的API缓存
-
-        Args:
-            cache_key: 缓存键
-        """
-        sql = """
-        DELETE FROM api_cache
-        WHERE cache_key = $1
-        """
-
-        async with self.pool.acquire() as conn:
-            await conn.execute(sql, cache_key)
 
     async def save_fills(self, address: str, fills: List[Dict]):
         """
@@ -717,6 +639,33 @@ class DataStore:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(sql, address)
             return [dict(row) for row in rows]
+
+    async def has_recent_liquidation(self, address: str, days: int = 7) -> bool:
+        """
+        检查地址在最近指定天数内是否有爆仓记录
+
+        Args:
+            address: 用户地址
+            days: 检查的天数范围，默认7天
+
+        Returns:
+            True 表示有爆仓记录，False 表示无爆仓记录
+        """
+        sql = """
+        SELECT EXISTS (
+            SELECT 1 FROM fills
+            WHERE address = $1
+              AND liquidation IS NOT NULL
+              AND time >= NOW() - INTERVAL '%s days'
+        ) AS has_liquidation
+        """ % days
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(sql, address)
+            has_liq = row['has_liquidation'] if row else False
+            if has_liq:
+                logger.info(f"[{address[:10]}...] 检测到最近 {days} 天内有爆仓记录")
+            return has_liq
 
     async def get_latest_fill_time(self, address: str) -> Optional[int]:
         """

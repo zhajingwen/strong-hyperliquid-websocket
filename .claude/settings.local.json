@@ -31,7 +31,9 @@
       "Bash(git log:*)",
       "Bash(uv run:*)",
       "Bash(grep:*)",
-      "Bash(docker exec:*)"
+      "Bash(docker exec:*)",
+      "Bash(vulture:*)",
+      "Bash(uv pip install:*)"
     ]
   }
 }

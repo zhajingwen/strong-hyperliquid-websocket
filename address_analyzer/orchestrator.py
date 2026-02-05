@@ -223,9 +223,17 @@ class Orchestrator:
             qualified_count = 0
             skipped_no_fills = 0
             skipped_filters = 0
+            skipped_liquidation = 0
 
             for idx, addr in enumerate(addresses, 1):
                 logger.info(f"[{idx}/{len(addresses)}] 计算指标: {addr}")
+
+                # 检查最近1周是否有爆仓记录（优先检查，避免无效计算）
+                has_recent_liq = await self.store.has_recent_liquidation(addr, days=7)
+                if has_recent_liq:
+                    skipped_liquidation += 1
+                    logger.warning(f"[{idx}/{len(addresses)}] 地址 {addr[:10]}... 最近1周有爆仓记录，跳过分析")
+                    continue
 
                 # 从数据库读取交易记录
                 fills = await self.store.get_fills(addr)
@@ -234,11 +242,11 @@ class Orchestrator:
                     logger.warning(f"[{idx}/{len(addresses)}] 地址无交易记录: {addr[:10]}... (跳过)")
                     continue
 
-                # 获取账户状态（从缓存）
-                state = await self.store.get_api_cache(f"user_state:{addr}")
+                # 获取账户状态（从数据库）
+                state = await self.store.get_latest_user_state(addr)
 
-                # 获取 Spot 账户状态（从缓存）
-                spot_state = await self.store.get_api_cache(f"spot_state:{addr}")
+                # 获取 Spot 账户状态（从数据库）
+                spot_state = await self.store.get_latest_spot_state(addr)
 
                 # 获取出入金统计
                 transfer_stats = await self.store.get_net_deposits(addr)
@@ -284,6 +292,7 @@ class Orchestrator:
             logger.info(
                 f"步骤 4/5 完成: 共计算 {calculated_count} 个地址，"
                 f"符合条件 {qualified_count} 个，"
+                f"最近爆仓跳过 {skipped_liquidation} 个，"
                 f"无交易记录 {skipped_no_fills} 个，"
                 f"不符合筛选条件 {skipped_filters} 个"
             )
@@ -310,6 +319,7 @@ class Orchestrator:
                 f"待处理地址: {len(pending_addresses)}\n"
                 f"成功获取数据: {success_count}\n"
                 f"获取失败: {failed_count}\n"
+                f"最近爆仓跳过: {skipped_liquidation}\n"
                 f"计算指标: {calculated_count}\n"
                 f"符合筛选条件: {qualified_count}\n"
                 f"最终报告地址数: {len(all_metrics)}\n"

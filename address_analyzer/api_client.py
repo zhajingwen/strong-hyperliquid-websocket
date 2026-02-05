@@ -9,7 +9,6 @@ from typing import Optional, List, Dict, Any
 import aiohttp
 from aiolimiter import AsyncLimiter
 from hyperliquid.info import Info
-from retry import retry
 
 from .data_store import DataStore
 from .utils import validate_eth_address, deduplicate_records
@@ -63,36 +62,81 @@ class HyperliquidAPIClient:
             'api_errors': 0
         }
 
-    @retry(exceptions=(aiohttp.ClientError, asyncio.TimeoutError), tries=3, delay=1, backoff=2, logger=logger)
-    async def _make_request(
+    async def _call_with_retry(
         self,
-        method: str,
-        endpoint: str,
-        params: Optional[Dict] = None
-    ) -> Optional[Dict]:
+        func: callable,
+        *args,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+        backoff: float = 2.0,
+        operation_name: str = "API调用",
+        **kwargs
+    ) -> Any:
         """
-        内部方法：发送 HTTP 请求（带重试）
+        通用重试包装器：为 SDK 调用添加重试逻辑
 
         Args:
-            method: HTTP 方法
-            endpoint: API 端点
-            params: 请求参数
+            func: 要调用的函数（SDK 方法）
+            *args: 函数参数
+            max_retries: 最大重试次数（默认3次）
+            retry_delay: 首次重试延迟（秒，默认1秒）
+            backoff: 退避倍数（默认2倍）
+            operation_name: 操作名称（用于日志）
+            **kwargs: 函数关键字参数
 
         Returns:
-            响应数据或None
-        """
-        url = f"{self.BASE_URL}/{endpoint}"
+            函数返回值
 
-        # 速率限制
-        async with self.rate_limiter:
-            # 并发控制
-            async with self.semaphore:
-                async with aiohttp.ClientSession() as session:
-                    async with session.request(method, url, json=params) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
+        Raises:
+            最后一次重试仍失败时抛出原始异常
+        """
+        last_exception = None
+        current_delay = retry_delay
+
+        for attempt in range(max_retries):
+            try:
+                # 速率限制 + 并发控制
+                async with self.rate_limiter:
+                    async with self.semaphore:
+                        # 同步函数用 run_in_executor 执行，避免阻塞事件循环
+                        if asyncio.iscoroutinefunction(func):
+                            result = await func(*args, **kwargs)
+                        else:
+                            loop = asyncio.get_event_loop()
+                            result = await loop.run_in_executor(
+                                None, lambda: func(*args, **kwargs)
+                            )
                         self.stats['total_requests'] += 1
-                        return data
+                        return result
+
+            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, TimeoutError) as e:
+                last_exception = e
+                self.stats['api_errors'] += 1
+
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"[{operation_name}] 第 {attempt + 1}/{max_retries} 次请求失败，"
+                        f"{current_delay:.1f}s 后重试: {type(e).__name__}: {str(e)}"
+                    )
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+                else:
+                    logger.error(
+                        f"[{operation_name}] 已达最大重试次数 ({max_retries})，放弃请求: "
+                        f"{type(e).__name__}: {str(e)}"
+                    )
+
+            except Exception as e:
+                # 非网络错误，不重试
+                self.stats['api_errors'] += 1
+                logger.error(
+                    f"[{operation_name}] 发生非网络错误，不重试: "
+                    f"{type(e).__name__}: {str(e)}"
+                )
+                raise
+
+        # 所有重试都失败
+        raise last_exception
 
     async def get_user_fills(
         self,
@@ -144,17 +188,6 @@ class HyperliquidAPIClient:
                 start_time = 0
                 logger.info(f"[{address}] 全量更新模式")
 
-            # 缓存键包含增量标识
-            cache_key = f"user_fills:{address}:incremental={incremental}:start={start_time}"
-
-            # 检查缓存（增量模式通常跳过缓存）
-            if use_cache and not incremental:
-                cached = await self.store.get_api_cache(cache_key)
-                if cached:
-                    self.stats['cache_hits'] += 1
-                    logger.debug(f"缓存命中: {cache_key}")
-                    return cached
-
             all_fills = []
             page = 0
 
@@ -162,26 +195,17 @@ class HyperliquidAPIClient:
 
             while True:
                 try:
-                    async with self.rate_limiter:
-                        async with self.semaphore:
-                            fills = self.info.user_fills_by_time(
-                                address,
-                                start_time=start_time,
-                                aggregate_by_time=True
-                            )
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logger.error(
-                        f"[{address}] API 请求失败 (第 {page + 1} 页)\n"
-                        f"  异常类型: {type(e).__name__}\n"
-                        f"  异常消息: {str(e)}"
+                    fills = await self._call_with_retry(
+                        self.info.user_fills_by_time,
+                        address,
+                        start_time=start_time,
+                        aggregate_by_time=True,
+                        operation_name=f"get_fills({address[:10]}..., page={page + 1})"
                     )
-                    break
                 except Exception as e:
                     logger.error(
-                        f"[{address}] 获取 fills 发生未知错误 (第 {page + 1} 页)\n"
-                        f"  异常类型: {type(e).__name__}\n"
-                        f"  异常消息: {str(e)}",
-                        exc_info=True
+                        f"[{address}] 获取 fills 最终失败 (第 {page + 1} 页): "
+                        f"{type(e).__name__}: {str(e)}"
                     )
                     break
 
@@ -237,14 +261,10 @@ class HyperliquidAPIClient:
                 # 避免API限流，每页之间延迟500ms
                 time.sleep(0.5)
 
-            # 增量模式：直接保存到数据库（不使用缓存）
-            if incremental and all_fills:
+            # 保存到数据库（统一使用 fills 表）
+            if all_fills:
                 await self.store.save_fills(address, all_fills)
-                logger.info(f"[{address}] 增量数据已保存: {len(all_fills)} 条新记录")
-
-            # 更新缓存（仅全量模式）
-            if use_cache and not incremental and all_fills:
-                await self.store.set_api_cache(cache_key, all_fills, self.cache_ttl_hours)
+                logger.info(f"[{address}] 数据已保存: {len(all_fills)} 条{'新' if incremental else ''}记录")
 
             # 更新数据新鲜度标记（无论是否有新数据，API 调用成功即更新）
             await self.store.update_data_freshness(address, 'fills')
@@ -280,33 +300,21 @@ class HyperliquidAPIClient:
             logger.error(f"无效的地址格式: {address}")
             return None
 
-        # 24小时新鲜度检查：如果数据在TTL内，直接返回数据库数据
-        if await self.store.is_data_fresh(address, 'user_state', self.cache_ttl_hours):
+        # 新鲜度检查：如果数据在TTL内，直接返回数据库数据
+        if use_cache and await self.store.is_data_fresh(address, 'user_state', self.cache_ttl_hours):
             logger.info(f"[{address}] user_state 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
             return await self.store.get_latest_user_state(address)
 
-        cache_key = f"user_state:{address}"
-
-        # 检查缓存
-        if use_cache:
-            cached = await self.store.get_api_cache(cache_key)
-            if cached:
-                self.stats['cache_hits'] += 1
-                logger.debug(f"缓存命中: {cache_key}")
-                return cached
-
-        # 使用 Hyperliquid SDK - 应用速率限制
+        # 使用 Hyperliquid SDK - 带重试
         try:
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    state = self.info.user_state(address)
+            state = await self._call_with_retry(
+                self.info.user_state,
+                address,
+                operation_name=f"get_user_state({address[:10]}...)"
+            )
             logger.info(f"获取账户状态: {address}")
 
-            # 更新缓存
-            if use_cache and state:
-                await self.store.set_api_cache(cache_key, state, self.cache_ttl_hours)
-
-            # 持久化到数据库
+            # 保存到数据库
             if state:
                 await self.store.save_user_state(address, state)
 
@@ -316,7 +324,7 @@ class HyperliquidAPIClient:
             return state
 
         except Exception as e:
-            logger.error(f"获取 user_state 失败: {address} - {e}")
+            logger.error(f"获取 user_state 最终失败: {address} - {e}")
             return None
 
     async def get_spot_state(
@@ -344,31 +352,17 @@ class HyperliquidAPIClient:
             logger.info(f"[{address}] spot_state 数据在 {self.cache_ttl_hours} 小时内，使用数据库缓存")
             return await self.store.get_latest_spot_state(address)
 
-        cache_key = f"spot_state:{address}"
-
-        # 检查缓存
-        if use_cache:
-            cached = await self.store.get_api_cache(cache_key)
-            if cached:
-                self.stats['cache_hits'] += 1
-                logger.debug(f"缓存命中: {cache_key}")
-                return cached
-
-        # 使用 Hyperliquid SDK 的 post 方法获取 Spot 账户状态
+        # 使用 Hyperliquid SDK 的 post 方法获取 Spot 账户状态 - 带重试
         try:
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    spot_state = self.info.post("/info", {
-                        "type": "spotClearinghouseState",
-                        "user": address
-                    })
+            spot_state = await self._call_with_retry(
+                self.info.post,
+                "/info",
+                {"type": "spotClearinghouseState", "user": address},
+                operation_name=f"get_spot_state({address[:10]}...)"
+            )
             logger.info(f"获取 Spot 账户状态: {address}")
 
-            # 更新缓存
-            if use_cache and spot_state:
-                await self.store.set_api_cache(cache_key, spot_state, self.cache_ttl_hours)
-
-            # 持久化到数据库
+            # 保存到数据库
             if spot_state:
                 await self.store.save_spot_state(address, spot_state)
 
@@ -378,7 +372,7 @@ class HyperliquidAPIClient:
             return spot_state
 
         except Exception as e:
-            logger.error(f"获取 spotClearinghouseState 失败: {address} - {e}")
+            logger.error(f"获取 spotClearinghouseState 最终失败: {address} - {e}")
             return None
 
     async def get_user_funding(
@@ -387,7 +381,6 @@ class HyperliquidAPIClient:
         start_time: int = 0,
         end_time: Optional[int] = None,
         use_cache: bool = True,
-        enable_pagination: bool = True,
         incremental: bool = True
     ) -> List[Dict]:
         """
@@ -401,7 +394,6 @@ class HyperliquidAPIClient:
             start_time: 起始时间（毫秒时间戳），默认为0（从最早开始）
             end_time: 结束时间（毫秒时间戳），默认为None（到当前时间）
             use_cache: 是否使用缓存（默认 True）
-            enable_pagination: 是否启用分页（默认 True）
             incremental: 是否启用增量更新（默认 True）
 
         Returns:
@@ -427,22 +419,6 @@ class HyperliquidAPIClient:
             else:
                 logger.info(f"[{address}] 资金费率首次获取: 从 0 开始")
 
-        # 优化的缓存键：包含时间范围
-        cache_key = f"user_funding:{address}:{start_time}:{end_time}"
-
-        # 缓存检查（增量模式跳过缓存）
-        if use_cache and not incremental:
-            cached = await self.store.get_api_cache(cache_key)
-            if cached:
-                self.stats['cache_hits'] += 1
-                logger.debug(f"缓存命中: {cache_key}")
-                logger.info(f"使用缓存的资金费率历史: {address} ({len(cached)} 条)")
-                return cached
-
-        # 如果禁用分页，使用单次查询
-        if not enable_pagination:
-            return await self._get_user_funding_single(address, start_time, end_time, use_cache, cache_key)
-
         # 分页查询主逻辑
         all_funding = []
         current_start = start_time
@@ -452,10 +428,12 @@ class HyperliquidAPIClient:
 
         try:
             while True:
-                # API 调用
-                async with self.rate_limiter:
-                    async with self.semaphore:
-                        funding = self.info.user_funding_history(address, current_start, end_time)
+                # API 调用 - 带重试
+                funding = await self._call_with_retry(
+                    self.info.user_funding_history,
+                    address, current_start, end_time,
+                    operation_name=f"get_funding({address[:10]}..., page={page + 1})"
+                )
 
                 # 没有更多数据
                 if not funding:
@@ -496,12 +474,7 @@ class HyperliquidAPIClient:
             )
             logger.info(f"[{address}] 资金费率去重后: {len(all_funding)} 条记录")
 
-        # 更新缓存
-        if use_cache and all_funding:
-            await self.store.set_api_cache(cache_key, all_funding, self.cache_ttl_hours)
-            logger.debug(f"资金费率缓存已更新: {cache_key}")
-
-        # 持久化到数据库
+        # 保存到数据库
         if all_funding:
             await self.store.save_funding_history(address, all_funding)
 
@@ -510,59 +483,12 @@ class HyperliquidAPIClient:
 
         return all_funding
 
-    async def _get_user_funding_single(
-        self,
-        address: str,
-        start_time: int = 0,
-        end_time: Optional[int] = None,
-        use_cache: bool = True,
-        cache_key: Optional[str] = None
-    ) -> List[Dict]:
-        """
-        单次查询版本（保留用于快速降级）
-
-        仅当 enable_pagination=False 时使用
-
-        Args:
-            address: 用户地址
-            start_time: 起始时间戳（毫秒）
-            end_time: 结束时间戳（毫秒）
-            use_cache: 是否使用缓存
-            cache_key: 缓存键（可选）
-
-        Returns:
-            资金费率记录列表
-        """
-        try:
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    funding = self.info.user_funding_history(address, start_time, end_time)
-
-            logger.info(f"获取资金费率历史（单次查询）: {address} ({len(funding) if funding else 0} 条)")
-
-            result = funding if funding else []
-
-            # 更新缓存
-            if use_cache and result and cache_key:
-                await self.store.set_api_cache(cache_key, result, self.cache_ttl_hours)
-
-            # 持久化到数据库
-            if result:
-                await self.store.save_funding_history(address, result)
-
-            return result
-
-        except Exception as e:
-            logger.warning(f"获取 user_funding_history 失败: {address} - {e}")
-            return []
-
     async def get_user_ledger(
         self,
         address: str,
         start_time: int = 0,
         end_time: Optional[int] = None,
         use_cache: bool = True,
-        enable_pagination: bool = True,
         incremental: bool = True
     ) -> List[Dict]:
         """
@@ -576,7 +502,6 @@ class HyperliquidAPIClient:
             start_time: 起始时间戳（毫秒）
             end_time: 结束时间戳（毫秒）
             use_cache: 是否使用缓存
-            enable_pagination: 是否启用分页（默认 True）
             incremental: 是否启用增量更新（默认 True）
 
         Returns:
@@ -596,20 +521,6 @@ class HyperliquidAPIClient:
             else:
                 logger.info(f"[{address}] 出入金首次获取: 从 0 开始")
 
-        # 优化的缓存键：包含时间范围
-        cache_key = f"user_ledger:{address}:{start_time}:{end_time}"
-
-        # 缓存检查
-        if use_cache:
-            cached = await self.store.get_api_cache(cache_key)
-            if cached:
-                logger.info(f"使用缓存的出入金记录: {address} ({len(cached)} 条)")
-                return cached
-
-        # 如果禁用分页，使用单次查询
-        if not enable_pagination:
-            return await self._get_user_ledger_single(address, start_time, end_time)
-
         # 分页查询主逻辑
         all_ledger = []
         current_start = start_time
@@ -619,12 +530,12 @@ class HyperliquidAPIClient:
 
         try:
             while True:
-                # API 调用
-                async with self.rate_limiter:
-                    async with self.semaphore:
-                        ledger = self.info.user_non_funding_ledger_updates(
-                            address, current_start, end_time
-                        )
+                # API 调用 - 带重试
+                ledger = await self._call_with_retry(
+                    self.info.user_non_funding_ledger_updates,
+                    address, current_start, end_time,
+                    operation_name=f"get_ledger({address[:10]}..., page={page + 1})"
+                )
 
                 # 没有更多数据
                 if not ledger:
@@ -669,119 +580,15 @@ class HyperliquidAPIClient:
             )
             logger.info(f"[{address}] 去重后: {len(all_ledger)} 条记录")
 
-        # 更新缓存
-        if use_cache and all_ledger:
-            await self.store.set_api_cache(cache_key, all_ledger, self.cache_ttl_hours)
-
-        # 增量模式：保存到数据库
-        if incremental and all_ledger:
+        # 保存到数据库
+        if all_ledger:
             await self.store.save_transfers(address, all_ledger)
-            logger.info(f"[{address}] 出入金增量数据已保存: {len(all_ledger)} 条新记录")
+            logger.info(f"[{address}] 出入金数据已保存: {len(all_ledger)} 条{'新' if incremental else ''}记录")
 
         # 更新数据新鲜度标记（无论是否有新数据，API 调用成功即更新）
         await self.store.update_data_freshness(address, 'transfers')
 
         return all_ledger
-
-    async def _get_user_ledger_single(
-        self,
-        address: str,
-        start_time: int = 0,
-        end_time: Optional[int] = None
-    ) -> List[Dict]:
-        """
-        单次查询版本（保留用于快速降级）
-
-        仅当 enable_pagination=False 时使用
-
-        Args:
-            address: 用户地址
-            start_time: 起始时间戳（毫秒）
-            end_time: 结束时间戳（毫秒）
-
-        Returns:
-            账本变动列表
-        """
-        try:
-            async with self.rate_limiter:
-                async with self.semaphore:
-                    ledger = self.info.user_non_funding_ledger_updates(
-                        address, start_time, end_time
-                    )
-
-            logger.info(f"获取出入金记录（单次查询）: {address} ({len(ledger) if ledger else 0} 条)")
-            return ledger if ledger else []
-
-        except Exception as e:
-            logger.warning(f"获取 user_non_funding_ledger_updates 失败: {address} - {e}")
-            return []
-
-    def _classify_ledger_data(self, ledger: List[Dict], target_address: str) -> Dict[str, Any]:
-        """
-        分类出入金数据为流入/流出
-
-        Args:
-            ledger: 账本变动列表
-            target_address: 目标地址（用于判断流向）
-
-        Returns:
-            {
-                'incoming': [...],      # 流入记录
-                'outgoing': [...],      # 流出记录
-                'total_in': float,      # 总流入
-                'total_out': float,     # 总流出
-                'net_flow': float       # 净流入
-            }
-        """
-        incoming = []
-        outgoing = []
-        total_in = 0.0
-        total_out = 0.0
-
-        for record in ledger:
-            delta = record.get('delta', {})
-            record_type = delta.get('type')
-
-            # 提取金额和流向
-            amount = 0.0
-            is_incoming = False
-
-            if record_type == 'send':
-                # send 类型：检查 destination 字段
-                send_data = delta.get('send', {})
-                amount = float(send_data.get('amount', 0))
-                destination = send_data.get('destination', '').lower()
-                user = delta.get('user', '').lower()
-
-                # 如果目标地址是 destination，则为流入；如果是 user，则为流出
-                is_incoming = (destination == target_address.lower())
-
-            elif record_type == 'subAccountTransfer':
-                # subAccountTransfer 类型：检查 user 和 destination
-                transfer_data = delta.get('subAccountTransfer', {})
-                amount = float(transfer_data.get('usdc', 0))
-                destination = transfer_data.get('destination', '').lower()
-                user = delta.get('user', '').lower()
-
-                # 同样判断流向
-                is_incoming = (destination == target_address.lower())
-
-            # 分类统计
-            if amount > 0:
-                if is_incoming:
-                    incoming.append(record)
-                    total_in += amount
-                else:
-                    outgoing.append(record)
-                    total_out += amount
-
-        return {
-            'incoming': incoming,
-            'outgoing': outgoing,
-            'total_in': total_in,
-            'total_out': total_out,
-            'net_flow': total_in - total_out
-        }
 
     async def fetch_address_data(
         self,

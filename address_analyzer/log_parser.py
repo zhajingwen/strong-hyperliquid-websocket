@@ -138,24 +138,3 @@ class LogParser:
                 for s in sorted_by_maker[:10]
             ]
         }
-
-
-if __name__ == '__main__':
-    # 测试代码
-    logging.basicConfig(level=logging.INFO)
-
-    parser = LogParser('trades.log')
-    summary = parser.get_summary()
-
-    print(f"\n{'='*60}")
-    print(f"日志解析摘要")
-    print(f"{'='*60}")
-    print(f"总地址数: {summary['total_addresses']}")
-    print(f"总 Taker 交易: {summary['total_taker_trades']}")
-    print(f"总 Maker 交易: {summary['total_maker_trades']}")
-    print(f"\n前10个最活跃 Taker 地址:")
-    for i, addr_info in enumerate(summary['top_taker_addresses'], 1):
-        print(f"  {i}. {addr_info['address'][:10]}...{addr_info['address'][-8:]}: {addr_info['count']} 笔")
-    print(f"\n前10个最活跃 Maker 地址:")
-    for i, addr_info in enumerate(summary['top_maker_addresses'], 1):
-        print(f"  {i}. {addr_info['address'][:10]}...{addr_info['address'][-8:]}: {addr_info['count']} 笔")

@@ -41,8 +41,10 @@ SUBSCRIPTIONS = [
     # {"type": "allMids"},  # 全市场中间价，高频更新
 
     # 市场数据
-    {"type": "l2Book", "coin": "PURR"},
-    {"type": "trades", "coin": "PURR"},
+    # {"type": "l2Book", "coin": "PURR"},
+    # {"type": "trades", "coin": "PURR"},
+    # {"type": "l2Book", "coin": "SNDK"},                                                                                               
+    {"type": "trades", "coin": "SNDK"},      
     # {"type": "candle", "coin": "PURR", "interval": "5m"},
     # {"type": "bbo", "coin": "ETH"},
 

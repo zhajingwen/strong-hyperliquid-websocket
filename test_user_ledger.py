@@ -36,7 +36,7 @@ async def test_user_ledger():
     )
 
     # 测试地址（已知有数据）
-    test_address = "0xde786a32f80731923d6297c14ef43ca1c8fd4b44"
+    test_address = "0xcd87ea212314217b6aa64fdffb9954330db5de4f"
 
     # 获取所有历史记录（start_time = 0 表示从最早开始）
     start_time = 0
@@ -371,10 +371,6 @@ async def test_pagination():
 
     print(f"\n【测试1】启用分页（默认行为）")
     try:
-        # 清除缓存以确保真实 API 调用
-        cache_key = f"user_ledger:{test_address}:0:None"
-        await store.delete_api_cache(cache_key)
-
         result = await client.get_user_ledger(test_address, use_cache=False)
         print(f"  ✅ 获取 {len(result)} 条记录")
 
@@ -630,31 +626,4 @@ async def test_data_integrity():
 
 
 if __name__ == '__main__':
-    # 运行测试
-    print("选择测试:")
-    print("  1. 基础接口测试 (test_user_ledger)")
-    print("  2. 完整工作流测试 (test_full_workflow)")
-    print("  3. 分页功能测试 (test_pagination) - 新增")
-    print("  4. 数据完整性验证 (test_data_integrity) - 新增")
-    print("  5. 运行所有测试")
-
-    import sys
-    if len(sys.argv) > 1:
-        choice = sys.argv[1]
-    else:
-        choice = input("请选择 (1/2/3/4/5, 默认=5): ").strip() or "5"
-
-    if choice == "1":
-        asyncio.run(test_user_ledger())
-    elif choice == "2":
-        asyncio.run(test_full_workflow())
-    elif choice == "3":
-        asyncio.run(test_pagination())
-    elif choice == "4":
-        asyncio.run(test_data_integrity())
-    else:
-        # 运行所有测试
-        asyncio.run(test_user_ledger())
-        asyncio.run(test_full_workflow())
-        asyncio.run(test_pagination())
-        asyncio.run(test_data_integrity())
+    asyncio.run(test_user_ledger())

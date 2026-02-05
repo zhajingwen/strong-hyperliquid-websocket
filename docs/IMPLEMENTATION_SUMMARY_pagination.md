@@ -89,11 +89,15 @@ async def get_user_ledger(
 
 **位置**: 第 363-378 行
 
-**新增方法**：
+**注意**: `delete_api_cache()` 方法已于 2026-02-05 移除（`api_cache` 表已弃用）。
+现在使用 `data_freshness` 表跟踪数据新鲜度，删除操作改为清除新鲜度标记：
 
 ```python
-async def delete_api_cache(self, cache_key: str):
-    """删除指定的API缓存"""
+# 强制重新获取数据
+await store.pool.execute(
+    "DELETE FROM data_freshness WHERE address = $1 AND data_type = $2",
+    address, data_type
+)
 ```
 
 ### 3. test_user_ledger.py

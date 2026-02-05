@@ -275,12 +275,14 @@ asyncio.run(test_cache_performance())
 ### 清除缓存
 
 ```python
-# 清除特定地址的缓存
-cache_key = f"user_funding:{address}:0:None"
-await store.delete_api_cache(cache_key)
+# 注意: api_cache 表已移除（2026-02-05）
+# 现在使用专用数据表 + data_freshness 表进行数据管理
 
-# 或在数据库中清除所有过期缓存
-# DELETE FROM api_cache WHERE expires_at < NOW();
+# 清除数据新鲜度标记（强制重新获取）
+await store.pool.execute(
+    "DELETE FROM data_freshness WHERE address = $1 AND data_type = $2",
+    address, 'funding'
+)
 ```
 
 ---

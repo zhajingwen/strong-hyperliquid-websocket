@@ -386,9 +386,9 @@ async def prefetch_spot_states(self, addresses: List[str]):
 
     missing_addresses = []
     for addr in addresses:
-        cache_key = f"spot_state:{addr}"
-        cached = await self.store.get_api_cache(cache_key)
-        if not cached:
+        # 检查数据新鲜度
+        is_fresh = await self.store.is_data_fresh(addr, 'spot_state')
+        if not is_fresh:
             missing_addresses.append(addr)
 
     # 只获取缺失的

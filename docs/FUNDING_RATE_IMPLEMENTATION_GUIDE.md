@@ -517,13 +517,16 @@ async def fetch_funding_data(
     Returns:
         {'funding_payments': List[Dict], 'stats': Dict}
     """
-    # 1. 检查缓存
-    cache_key = f"user_funding:{address}"
-    cached_data = await self.store.get_api_cache(cache_key)
-
-    if cached_data and not self.force_refresh:
-        logger.info(f"使用缓存的资金费率数据: {address[:10]}...")
-        return cached_data
+    # 1. 检查数据新鲜度
+    if not self.force_refresh:
+        is_fresh = await self.store.is_data_fresh(address, 'funding')
+        if is_fresh:
+            # 从数据库获取已有数据
+            existing_data = await self.store.get_funding_payments(address)
+            if existing_data:
+                logger.info(f"使用缓存的资金费率数据: {address[:10]}...")
+                stats = self._calculate_funding_stats(existing_data)
+                return {'funding_payments': existing_data, 'stats': stats}
 
     # 2. 调用 API
     try:
@@ -547,12 +550,13 @@ async def fetch_funding_data(
         # 4. 计算统计数据
         stats = self._calculate_funding_stats(funding_history)
 
-        # 5. 更新缓存
+        # 5. 更新数据新鲜度标记
+        await self.store.update_data_freshness(address, 'funding')
+
         result = {
             'funding_payments': funding_history,
             'stats': stats
         }
-        await self.store.set_api_cache(cache_key, result, ttl_hours=1)
 
         # 更新统计
         self.stats['total_requests'] += 1
@@ -882,8 +886,8 @@ async def run(self, ...):
     for addr in addresses:
         # 现有数据
         fills = await self.store.get_fills(addr)
-        state = await self.store.get_api_cache(f"user_state:{addr}")
-        spot_state = await self.store.get_api_cache(f"spot_state:{addr}")
+        state = await self.store.get_latest_user_state(addr)
+        spot_state = await self.store.get_latest_spot_state(addr)
         transfer_stats = await self.store.get_net_deposits(addr)
 
         # 新增: 获取资金费率统计

@@ -8,11 +8,17 @@
 **字符集**: UTF-8
 **时区**: UTC
 **最后更新**: 2026-02-05
-**表总数**: 11 张
+**表总数**: 10 张
 
 ---
 
 ## 📝 变更历史
+
+### 2026-02-05 - 移除 api_cache 表
+- ❌ **删除** `api_cache` 表（API响应缓存）
+- 📄 **原因**: 该表功能与专用数据表（`user_states`, `spot_states`, `fills` 等）重复，导致数据不一致问题
+- 🔧 **效果**: 简化缓存架构，统一使用专用数据表 + `data_freshness` 表进行数据管理
+- ✅ **影响**: `get_api_cache()`, `set_api_cache()`, `delete_api_cache()` 方法已移除
 
 ### 2026-02-05 - fills 表添加 liquidation 字段
 - 🆕 **新增** `fills.liquidation` 字段（JSONB 类型）
@@ -42,7 +48,7 @@
 
 ## 📊 表结构总览
 
-### 核心业务表 (11张)
+### 核心业务表 (10张)
 
 | 表名 | 用途 | 记录数量级 | TimescaleDB | 更新频率 |
 |------|------|-----------|-------------|---------|
@@ -54,7 +60,6 @@
 | `funding_history` | 资金费率历史 | 500K - 5M | ✅ | 每3小时 |
 | `account_snapshots` | 账户快照 | 100K - 1M | ❌ | 每小时 |
 | `metrics_cache` | 指标缓存 | 10K - 100K | ❌ | 每小时 |
-| `api_cache` | API响应缓存 | 10K - 100K | ❌ | 按TTL |
 | `processing_status` | 处理状态表 | 10K - 100K | ❌ | 实时 |
 | `data_freshness` | 数据新鲜度跟踪 🆕 | 10K - 500K | ❌ | 实时 |
 
@@ -1048,118 +1053,7 @@ LIMIT 10;
 
 ---
 
-### 9. api_cache - API响应缓存表
-
-**用途**: 缓存 Hyperliquid API 的响应数据,减少重复请求
-
-**表结构**:
-
-```sql
-CREATE TABLE api_cache (
-    cache_key VARCHAR(255) PRIMARY KEY,        -- 缓存键
-    response_data JSONB,                       -- 响应数据(JSON格式)
-    cached_at TIMESTAMPTZ DEFAULT NOW(),       -- 缓存时间
-    expires_at TIMESTAMPTZ,                    -- 过期时间
-    CONSTRAINT chk_cache_expiry CHECK (expires_at > cached_at)
-);
-
-COMMENT ON TABLE api_cache IS 'API响应缓存(减少重复请求)';
-COMMENT ON COLUMN api_cache.response_data IS 'JSONB格式,支持JSON查询';
-```
-
-**字段详解**:
-
-| 字段 | 类型 | 约束 | 说明 | 示例值 |
-|------|------|------|------|--------|
-| `cache_key` | VARCHAR(255) | PRIMARY KEY | 缓存键 | `user_state:0x162cc7...` |
-| `response_data` | JSONB | - | API响应数据(JSON) | `{"accountValue": "50234.56", ...}` |
-| `cached_at` | TIMESTAMPTZ | DEFAULT NOW() | 缓存时间 | `2026-02-03 14:00:00+00` |
-| `expires_at` | TIMESTAMPTZ | - | 过期时间 | `2026-02-03 15:00:00+00` |
-
-**缓存键格式**:
-
-| 缓存键格式 | API方法 | TTL | 说明 |
-|-----------|---------|-----|------|
-| `user_state:{address}` | `user_state()` | 1小时 | 用户账户状态 |
-| `spot_state:{address}` | `spot_user_state()` | 1小时 | Spot账户状态 |
-| `user_fills:{address}` | `user_fills()` | 1小时 | 用户成交记录 |
-| `user_ledger:{address}` | `user_non_funding_ledger_updates()` | 1小时 | 账本变动 |
-| `user_funding:{address}` | `user_funding_history()` | 1小时 | 资金费率历史 |
-
-**索引**:
-
-```sql
--- 主键索引(自动创建)
--- PRIMARY KEY (cache_key)
-
--- 按过期时间查询(清理过期缓存)
-CREATE INDEX idx_api_cache_expires ON api_cache(expires_at);
-
--- JSONB字段索引(可选,用于JSON查询)
-CREATE INDEX idx_api_cache_data ON api_cache USING GIN (response_data);
-```
-
-**查询示例**:
-
-```sql
--- 1. 查询有效缓存
-SELECT
-    cache_key,
-    response_data,
-    cached_at,
-    expires_at
-FROM api_cache
-WHERE cache_key = 'user_state:0x162cc7c861ebd0c06b3d72319201150482518185'
-  AND expires_at > NOW();
-
--- 2. 清理过期缓存
-DELETE FROM api_cache
-WHERE expires_at < NOW();
-
--- 3. 查询缓存统计
-SELECT
-    CASE
-        WHEN cache_key LIKE 'user_state:%' THEN 'user_state'
-        WHEN cache_key LIKE 'spot_state:%' THEN 'spot_state'
-        WHEN cache_key LIKE 'user_fills:%' THEN 'user_fills'
-        WHEN cache_key LIKE 'user_ledger:%' THEN 'user_ledger'
-        WHEN cache_key LIKE 'user_funding:%' THEN 'user_funding'
-        ELSE 'other'
-    END AS cache_type,
-    COUNT(*) AS cache_count,
-    COUNT(*) FILTER (WHERE expires_at > NOW()) AS valid_count,
-    COUNT(*) FILTER (WHERE expires_at <= NOW()) AS expired_count
-FROM api_cache
-GROUP BY cache_type;
-
--- 4. JSON查询示例(查询账户价值)
-SELECT
-    cache_key,
-    response_data->>'accountValue' AS account_value,
-    cached_at
-FROM api_cache
-WHERE cache_key LIKE 'user_state:%'
-  AND (response_data->>'accountValue')::numeric > 10000
-ORDER BY (response_data->>'accountValue')::numeric DESC;
-```
-
-**数据来源**: Hyperliquid API 调用结果
-
-**更新频率**: 按需更新,过期后自动刷新
-
-**清理策略**:
-
-```python
-# 定期清理过期缓存(建议每小时运行)
-async def cleanup_expired_cache():
-    await store.pool.execute(
-        "DELETE FROM api_cache WHERE expires_at < NOW()"
-    )
-```
-
----
-
-### 10. processing_status - 处理状态表
+### 9. processing_status - 处理状态表
 
 **用途**: 跟踪地址数据获取和处理的状态,支持错误重试
 
@@ -1521,7 +1415,7 @@ ORDER BY total_funding DESC;
 
 ---
 
-### 14. data_freshness - 数据新鲜度跟踪表 🆕
+### 10. data_freshness - 数据新鲜度跟踪表 🆕
 
 **用途**: 跟踪各数据类型的最后成功获取时间，用于智能缓存判断
 
@@ -1690,10 +1584,10 @@ async def update_data_freshness(address: str, data_type: str):
 │   (综合指标)     │  │   (账户快照)         │
 └──────────────────┘  └──────────────────────┘
 
-┌──────────────────┐  ┌──────────────────────┐
-│   api_cache      │  │  processing_status   │
-│  (API响应缓存)   │  │   (处理状态跟踪)     │
-└──────────────────┘  └──────────────────────┘
+┌──────────────────────┐
+│  processing_status   │
+│   (处理状态跟踪)     │
+└──────────────────────┘
 ```
 
 **表分类说明**:
@@ -1703,7 +1597,7 @@ async def update_data_freshness(address: str, data_type: str):
 | **核心数据** | `fills`, `transfers`, `funding_history` | 时序交易数据(TimescaleDB) |
 | **状态快照** | `user_states`, `spot_states`, `account_snapshots` | 账户状态历史 |
 | **元数据** | `addresses`, `processing_status`, `data_freshness` | 地址和处理状态 |
-| **缓存层** | `api_cache`, `metrics_cache` | 性能优化缓存 |
+| **缓存层** | `metrics_cache` | 性能优化缓存 |
 
 ---
 
@@ -1787,9 +1681,6 @@ FROM timescaledb_information.hypertables;
 ### 数据清理脚本
 
 ```sql
--- 清理过期缓存
-DELETE FROM api_cache WHERE expires_at < NOW();
-
 -- 清理旧的账户快照(保留90天)
 DELETE FROM account_snapshots
 WHERE snapshot_time < NOW() - INTERVAL '90 days';
@@ -1834,8 +1725,6 @@ UNION ALL
 SELECT 'metrics_cache', COUNT(*) FROM metrics_cache
 UNION ALL
 SELECT 'funding_stats', COUNT(*) FROM funding_stats
-UNION ALL
-SELECT 'api_cache', COUNT(*) FROM api_cache
 UNION ALL
 SELECT 'processing_status', COUNT(*) FROM processing_status;
 ```

@@ -43,42 +43,14 @@ async def verify_fixes():
                 print("  ⚠️  无交易数据")
                 continue
 
-            state_key = f"user_state:{address}"
-            state = await store.get_api_cache(state_key)
+            state = await store.get_latest_user_state(address)
 
             if not state:
                 print("  ⚠️  无账户状态")
                 continue
 
-            # 尝试获取出入金数据
-            transfer_key = f"user_ledger_updates:{address}"
-            ledger_data = await store.get_api_cache(transfer_key)
-            transfer_data = None
-
-            if ledger_data:
-                # 提取出入金统计
-                net_deposits = 0.0
-                total_deposits = 0.0
-                total_withdrawals = 0.0
-
-                for update in ledger_data:
-                    delta = float(update.get('delta', {}).get('total', 0))
-                    update_type = update.get('delta', {}).get('type')
-
-                    if update_type in ['deposit', 'internalTransfer']:
-                        if delta > 0:
-                            total_deposits += delta
-                            net_deposits += delta
-                    elif update_type == 'withdraw':
-                        if delta < 0:
-                            total_withdrawals += abs(delta)
-                            net_deposits += delta  # delta 为负
-
-                transfer_data = {
-                    'net_deposits': net_deposits,
-                    'total_deposits': total_deposits,
-                    'total_withdrawals': total_withdrawals
-                }
+            # 获取出入金统计（已计算好的数据）
+            transfer_data = await store.get_net_deposits(address)
 
             # 计算指标
             metrics = MetricsEngine.calculate_metrics(

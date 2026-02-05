@@ -43,6 +43,7 @@ class AddressMetrics:
     # P0 修复新增字段
     bankruptcy_count: int = 0           # 爆仓次数
     sharpe_method: str = "standard"     # 计算方法标记
+    has_recent_liquidation: bool = False  # 最近1周是否有爆仓记录
 
     # 回撤详细信息（P0优化新增）
     max_drawdown_legacy: float = 0.0       # 旧算法回撤（对比用）

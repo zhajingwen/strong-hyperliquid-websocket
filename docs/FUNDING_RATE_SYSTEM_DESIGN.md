@@ -211,13 +211,15 @@ async def fetch_funding_data(self, address: str, save_to_db: bool = True) -> Dic
     Returns:
         {'funding_payments': List[Dict], 'stats': Dict}
     """
-    # 1. 检查缓存
-    cache_key = f"user_funding:{address}"
-    cached_data = await self.store.get_api_cache(cache_key)
-
-    if cached_data and not self.force_refresh:
-        logger.info(f"使用缓存的资金费率数据: {address}")
-        return cached_data
+    # 1. 检查数据新鲜度
+    if not self.force_refresh:
+        is_fresh = await self.store.is_data_fresh(address, 'funding')
+        if is_fresh:
+            existing_data = await self.store.get_funding_payments(address)
+            if existing_data:
+                logger.info(f"使用缓存的资金费率数据: {address}")
+                stats = self._calculate_funding_stats(existing_data)
+                return {'funding_payments': existing_data, 'stats': stats}
 
     # 2. 调用 API
     try:
@@ -238,12 +240,13 @@ async def fetch_funding_data(self, address: str, save_to_db: bool = True) -> Dic
         if save_to_db and funding_history:
             await self.store.save_funding_payments(address, funding_history)
 
-        # 4. 更新缓存
+        # 4. 更新数据新鲜度标记
+        await self.store.update_data_freshness(address, 'funding')
+
         result = {
             'funding_payments': funding_history,
             'stats': self._calculate_funding_stats(funding_history)
         }
-        await self.store.set_api_cache(cache_key, result, ttl_hours=1)
 
         return result
 
@@ -803,15 +806,13 @@ def render_terminal(self, metrics: List[AddressMetrics], ...):
 # Level 1: 内存缓存(最快)
 memory_cache = {}  # {address: funding_stats}
 
-# Level 2: Redis 缓存(快)
+# Level 2: Redis 缓存(可选,快)
 redis_cache_key = f"funding:{address}"
 ttl = 3600  # 1小时
 
-# Level 3: PostgreSQL api_cache 表(中等)
-db_cache_key = f"user_funding:{address}"
-
-# Level 4: TimescaleDB funding_payments 表(慢,但完整)
-# 仅在缓存失效时查询
+# Level 3: PostgreSQL 专用数据表 + data_freshness(推荐)
+# - funding_payments 表: 完整历史数据
+# - data_freshness 表: 跟踪数据新鲜度
 ```
 
 **缓存失效策略**:
@@ -826,7 +827,7 @@ async def get_funding_stats(address: str) -> Dict:
         if (datetime.now() - cache_time).seconds < 300:  # 5分钟有效
             return memory_cache[address]['data']
 
-    # 2. 检查 Redis 缓存
+    # 2. 检查 Redis 缓存(可选)
     redis_data = await redis_client.get(f"funding:{address}")
     if redis_data:
         memory_cache[address] = {
@@ -835,25 +836,30 @@ async def get_funding_stats(address: str) -> Dict:
         }
         return redis_data
 
-    # 3. 检查数据库缓存
-    db_data = await store.get_api_cache(f"user_funding:{address}")
-    if db_data:
-        await redis_client.setex(f"funding:{address}", 3600, db_data)
-        memory_cache[address] = {
-            'data': db_data,
-            'cached_at': datetime.now()
-        }
-        return db_data
+    # 3. 检查数据新鲜度 + 从专用表获取
+    is_fresh = await store.is_data_fresh(address, 'funding')
+    if is_fresh:
+        db_data = await store.get_funding_payments(address)
+        if db_data:
+            stats = calculate_funding_stats(db_data)
+            await redis_client.setex(f"funding:{address}", 3600, stats)
+            memory_cache[address] = {
+                'data': stats,
+                'cached_at': datetime.now()
+            }
+            return stats
 
-    # 4. 从 API 获取并缓存
+    # 4. 从 API 获取并保存到专用表
     fresh_data = await fetch_from_api(address)
+    await store.save_funding_payments(address, fresh_data)
+    await store.update_data_freshness(address, 'funding')
 
-    # 逆向缓存传播
-    memory_cache[address] = {'data': fresh_data, 'cached_at': datetime.now()}
-    await redis_client.setex(f"funding:{address}", 3600, fresh_data)
-    await store.set_api_cache(f"user_funding:{address}", fresh_data, ttl_hours=1)
+    # 缓存传播
+    stats = calculate_funding_stats(fresh_data)
+    memory_cache[address] = {'data': stats, 'cached_at': datetime.now()}
+    await redis_client.setex(f"funding:{address}", 3600, stats)
 
-    return fresh_data
+    return stats
 ```
 
 ---
