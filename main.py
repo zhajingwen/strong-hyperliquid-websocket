@@ -236,8 +236,6 @@ def safe_print(msg: Any) -> None:
             # print("═" * 120 + "\n")
 
         elif channel == "l2Book":
-            if msg:
-                return
             # 订单簿 - 详细深度展示
             from datetime import datetime
 
