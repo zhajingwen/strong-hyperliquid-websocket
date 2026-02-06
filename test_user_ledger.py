@@ -297,7 +297,6 @@ async def test_full_workflow():
         print(f"     - 实际初始资金: ${metrics.actual_initial_capital:,.2f}")
         print(f"     - 校准ROI: {metrics.corrected_roi:.2f}%")
         print(f"     - 总PNL: ${metrics.total_pnl:,.2f}")
-        print(f"     - 最大回撤: {metrics.max_drawdown:.2f}%")
 
         # 验证新字段
         assert hasattr(metrics, 'net_deposits'), "应有 net_deposits 字段"
@@ -327,7 +326,6 @@ async def test_full_workflow():
             'win_rate': metrics.win_rate,
             'roi': metrics.roi,
             'total_pnl': metrics.total_pnl,
-            'max_drawdown': metrics.max_drawdown,
             'net_deposit': metrics.net_deposits
         })
         print(f"  ✅ metrics_cache 表已更新（包含 net_deposit 字段）")

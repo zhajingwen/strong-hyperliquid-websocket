@@ -130,7 +130,6 @@ class DataStore:
             win_rate DECIMAL(6, 2),
             total_pnl DECIMAL(20, 8),
             account_value DECIMAL(20, 8),
-            max_drawdown DECIMAL(8, 2),
             net_deposit DECIMAL(20, 8),
             calculated_at TIMESTAMPTZ DEFAULT NOW()
         );
@@ -1054,20 +1053,18 @@ class DataStore:
             'total_trades': int(metrics.get('total_trades', 0)),
             'win_rate': safe_value('win_rate', 100.0, 0.0),  # DECIMAL(6, 2): 0-100
             'total_pnl': safe_value('total_pnl', 999999999999.99999999, -999999999999.99999999),  # DECIMAL(20, 8)
-            'max_drawdown': safe_value('max_drawdown', 999999.99, 0.0),  # DECIMAL(8, 2)
             'net_deposit': safe_value('net_deposit', 999999999999.99999999, -999999999999.99999999)  # DECIMAL(20, 8)
         }
 
         sql = """
         INSERT INTO metrics_cache (
             address, total_trades, win_rate,
-            total_pnl, max_drawdown, net_deposit, calculated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            total_pnl, net_deposit, calculated_at
+        ) VALUES ($1, $2, $3, $4, $5, NOW())
         ON CONFLICT (address) DO UPDATE
         SET total_trades = EXCLUDED.total_trades,
             win_rate = EXCLUDED.win_rate,
             total_pnl = EXCLUDED.total_pnl,
-            max_drawdown = EXCLUDED.max_drawdown,
             net_deposit = EXCLUDED.net_deposit,
             calculated_at = NOW()
         """
@@ -1079,7 +1076,6 @@ class DataStore:
                 safe_metrics['total_trades'],
                 safe_metrics['win_rate'],
                 safe_metrics['total_pnl'],
-                safe_metrics['max_drawdown'],
                 safe_metrics['net_deposit']
             )
 

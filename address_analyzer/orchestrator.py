@@ -305,7 +305,6 @@ class Orchestrator:
                     'total_trades': metrics.total_trades,
                     'win_rate': metrics.win_rate,
                     'total_pnl': metrics.total_pnl,
-                    'max_drawdown': metrics.max_drawdown
                 })
 
                 calculated_count += 1

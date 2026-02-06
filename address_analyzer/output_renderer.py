@@ -134,7 +134,6 @@ class OutputRenderer:
         table.add_column("交易数", justify="right", width=8)
         table.add_column("胜率", justify="right", width=8)
         table.add_column("总PNL", justify="right", width=12)
-        table.add_column("最大回撤", justify="right", width=10)
 
         # 添加行
         for i, metrics in enumerate(metrics_list, 1):
@@ -146,8 +145,7 @@ class OutputRenderer:
                 metrics.address,
                 str(metrics.total_trades),
                 f"{metrics.win_rate:.1f}%",
-                f"[{pnl_color}]${metrics.total_pnl:,.0f}[/{pnl_color}]",
-                f"{metrics.max_drawdown:.1f}%"
+                f"[{pnl_color}]${metrics.total_pnl:,.0f}[/{pnl_color}]"
             )
 
         console.print(table)
@@ -240,7 +238,6 @@ class OutputRenderer:
                     <th>交易数</th>
                     <th>胜率</th>
                     <th>总PNL</th>
-                    <th>最大回撤</th>
                 </tr>
             </thead>
             <tbody>
@@ -253,7 +250,6 @@ class OutputRenderer:
                     <td class="{% if m.total_pnl > 0 %}positive{% else %}negative{% endif %}">
                         ${{ "{:,.0f}".format(m.total_pnl) }}
                     </td>
-                    <td>{{ m.max_drawdown|round(1) }}%</td>
                 </tr>
                 {% endfor %}
             </tbody>

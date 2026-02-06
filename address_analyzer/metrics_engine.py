@@ -18,7 +18,6 @@ class AddressMetrics:
     total_trades: int
     win_rate: float          # 胜率 (%)
     total_pnl: float         # 总PNL = 已实现PNL (USD)
-    max_drawdown: float      # 最大回撤 (%)
     avg_trade_size: float    # 平均交易规模
     total_volume: float      # 总交易量
     first_trade_time: int    # 首次交易时间
@@ -42,16 +41,6 @@ class AddressMetrics:
     bankruptcy_count: int = 0           # 爆仓次数
     has_recent_liquidation: bool = False  # 最近1周是否有爆仓记录
 
-    # 回撤详细信息（P0优化新增）
-    max_drawdown_legacy: float = 0.0       # 旧算法回撤（对比用）
-    drawdown_quality: str = "estimated"    # 回撤质量：enhanced|standard|estimated
-    drawdown_count: int = 0                # 回撤次数
-    largest_drawdown_pct: float = 0.0      # 单次最大回撤
-    drawdown_improvement_pct: float = 0.0  # 算法改进幅度
-
-    # 未实现盈亏回撤（P1优化新增）
-    max_drawdown_with_unrealized: float = 0.0  # 含未实现盈亏的回撤
-
     # ROI 扩展指标（P1优化新增）
     time_weighted_roi: float = 0.0         # 时间加权ROI（考虑资金使用时长）
     annualized_roi: float = 0.0            # 年化ROI
@@ -60,13 +49,6 @@ class AddressMetrics:
 
     # 累计收益率指标（新增）
     initial_capital_corrected: float = 0.0 # 校正后的账户初始值（含外部转入）
-
-    # 回撤期间分析（P2优化新增）
-    drawdown_periods_count: int = 0        # 回撤期间总数
-    avg_drawdown_duration_days: float = 0.0  # 平均回撤持续天数
-    avg_recovery_days: float = 0.0         # 平均恢复天数
-    longest_drawdown_days: int = 0         # 最长回撤持续天数
-    current_in_drawdown: bool = False      # 当前是否处于回撤中
 
 
 class MetricsEngine:
@@ -710,508 +692,6 @@ class MetricsEngine:
 
         return 0.0
 
-    @classmethod
-    def calculate_max_drawdown(
-        cls,
-        fills: List[Dict],
-        account_value: float = 0.0,
-        actual_initial_capital: Optional[float] = None,
-        ledger: Optional[List[Dict]] = None,
-        address: Optional[str] = None,
-        state: Optional[Dict] = None,  # 用于获取未实现盈亏
-        # P1性能优化：预计算数据参数
-        precalculated_events: Optional[List[Dict]] = None,
-        precalculated_realized_pnl: Optional[float] = None,
-        precalculated_sorted_fills: Optional[List[Dict]] = None
-    ) -> tuple[float, Dict]:
-        """
-        计算最大回撤（改进版：考虑出入金影响）
-
-        算法改进：
-        1. 从初始资金开始计算（而非第一笔交易的PNL）
-        2. 基于账户权益曲线（equity = 初始资金 + 累计PNL）
-        3. 修复初始峰值可能为负的BUG
-        4. 支持真实初始资金（如果提供出入金数据）
-        5. ✨ 考虑出入金事件（提现不算回撤，充值调整峰值）
-        6. P1性能优化：支持预计算数据，避免重复遍历
-
-        Args:
-            fills: 交易记录列表（按时间排序）
-            account_value: 当前账户价值
-            actual_initial_capital: 实际初始资金（可选）
-            ledger: 出入金记录（可选，提供则使用改进算法）
-            address: 用户地址（使用ledger时必需）
-            state: 用户状态数据（用于获取未实现盈亏）
-            precalculated_events: 预计算的事件列表（性能优化）
-            precalculated_realized_pnl: 预计算的已实现PNL（性能优化）
-            precalculated_sorted_fills: 预排序的fills列表（性能优化）
-
-        Returns:
-            (max_drawdown_pct, details)
-
-            details = {
-                'max_drawdown': float,           # 主要指标（考虑出入金）
-                'max_drawdown_legacy': float,    # 旧算法（对比用）
-                'quality': str,                  # 'enhanced' | 'standard' | 'estimated'
-                'drawdown_count': int,           # 回撤次数
-                'largest_drawdown_pct': float,   # 单次最大回撤
-            }
-
-        算法说明：
-            旧算法问题：
-            - 将提现误算为交易亏损，导致回撤虚高
-            - 未调整充值后的峰值
-
-            新算法（使用ledger时）：
-            - 合并交易和出入金事件，按时间排序
-            - 出入金事件调整峰值（而非视为盈亏）
-            - 只有交易盈亏才会产生回撤
-        """
-        if not fills:
-            empty_details = {
-                'max_drawdown': 0.0,
-                'max_drawdown_legacy': 0.0,
-                'quality': 'no_data',
-                'drawdown_count': 0,
-                'largest_drawdown_pct': 0.0
-            }
-            return 0.0, empty_details
-
-        # 如果提供了ledger数据，使用改进算法
-        if ledger is not None and address is not None:
-            return cls._calculate_dd_with_ledger(
-                fills, ledger, account_value, actual_initial_capital, address, state,
-                precalculated_events, precalculated_realized_pnl
-            )
-        else:
-            # 降级到旧算法
-            dd_pct, quality = cls._calculate_dd_legacy(
-                fills, account_value, actual_initial_capital,
-                precalculated_realized_pnl, precalculated_sorted_fills
-            )
-            details = {
-                'max_drawdown': dd_pct,
-                'max_drawdown_legacy': dd_pct,
-                'quality': quality,
-                'drawdown_count': 0,
-                'largest_drawdown_pct': dd_pct
-            }
-            return dd_pct, details
-
-    @classmethod
-    def _calculate_dd_legacy(
-        cls,
-        fills: List[Dict],
-        account_value: float,
-        actual_initial_capital: Optional[float] = None,
-        # P1性能优化参数
-        precalculated_realized_pnl: Optional[float] = None,
-        precalculated_sorted_fills: Optional[List[Dict]] = None
-    ) -> tuple[float, str]:
-        """
-        旧版最大回撤计算（保留作为降级方案）
-
-        Returns:
-            (max_drawdown_pct, quality)
-        """
-        # P1优化：使用预排序的fills
-        if precalculated_sorted_fills is not None:
-            sorted_fills = precalculated_sorted_fills
-        else:
-            sorted_fills = cls._ensure_sorted_fills(fills)
-
-        # 确定初始资金：优先使用真实初始资金，否则推算
-        if actual_initial_capital is not None and actual_initial_capital > 0:
-            initial_capital = actual_initial_capital
-            quality = 'standard'
-        else:
-            # P1优化：使用预计算的realized_pnl
-            if precalculated_realized_pnl is not None:
-                realized_pnl = precalculated_realized_pnl
-            else:
-                realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
-            initial_capital = account_value - realized_pnl
-            quality = 'estimated'
-
-        # 边界保护：初始资金不应为负或过小
-        if initial_capital <= 0:
-            initial_capital = max(account_value, 100)
-            quality = 'estimated_fallback'
-
-        # 构建权益曲线（从初始资金开始）
-        running_equity = initial_capital
-        peak = initial_capital
-        max_drawdown = 0.0
-
-        for fill in sorted_fills:
-            running_equity += MetricsEngine._get_pnl(fill)
-
-            # 更新峰值
-            if running_equity > peak:
-                peak = running_equity
-
-            # 计算当前回撤
-            if peak > 0:
-                drawdown = (peak - running_equity) / peak
-                max_drawdown = max(max_drawdown, drawdown)
-            elif running_equity < 0:
-                max_drawdown = max(max_drawdown, 1.0)  # 100%回撤
-
-        max_drawdown_pct = max_drawdown * 100
-
-        # 日志记录异常大的回撤（>200%）
-        if max_drawdown_pct > 200:
-            logger.warning(
-                f"检测到异常大的最大回撤: {max_drawdown_pct:.2f}% "
-                f"(初始资金: ${initial_capital:.2f}, 当前权益: ${running_equity:.2f})"
-            )
-
-        # 边界保护
-        max_drawdown_pct = min(max_drawdown_pct, 999.99)
-
-        return max_drawdown_pct, quality
-
-    @classmethod
-    def _calculate_dd_with_ledger(
-        cls,
-        fills: List[Dict],
-        ledger: List[Dict],
-        account_value: float,
-        actual_initial_capital: Optional[float],
-        address: str,
-        state: Optional[Dict] = None,  # 用于获取未实现盈亏
-        # P1性能优化参数
-        precalculated_events: Optional[List[Dict]] = None,
-        precalculated_realized_pnl: Optional[float] = None
-    ) -> tuple[float, Dict]:
-        """
-        改进版最大回撤计算（考虑出入金和未实现盈亏）
-
-        核心思想：
-        1. 合并交易和出入金事件，按时间排序
-        2. 出入金事件调整峰值（而非视为盈亏）
-        3. 只有交易盈亏才会产生回撤
-        4. 可选：计算含未实现盈亏的回撤
-        5. P1性能优化：支持预计算数据
-
-        Returns:
-            (max_drawdown_pct, details)
-        """
-        # P1优化：使用预计算的events
-        if precalculated_events is not None:
-            events = precalculated_events
-        else:
-            # 1. 合并所有事件
-            events = []
-
-            # 添加交易事件
-            for fill in fills:
-                events.append({
-                    'time': fill.get('time', 0),
-                    'type': 'trade',
-                    'pnl': MetricsEngine._get_pnl(fill)
-                })
-
-            # 添加出入金事件
-            for record in ledger:
-                amount = cls._extract_ledger_amount(record, address)
-                if amount != 0:
-                    events.append({
-                        'time': record.get('time', 0),
-                        'type': 'cash_flow',
-                        'amount': amount  # 正数=流入，负数=流出
-                    })
-
-            # 按时间排序
-            events.sort(key=lambda x: x['time'])
-
-        # 2. 确定初始资金
-        if actual_initial_capital is not None and actual_initial_capital > 0:
-            initial_capital = actual_initial_capital
-            quality = 'enhanced'
-        else:
-            # P1优化：使用预计算的realized_pnl
-            if precalculated_realized_pnl is not None:
-                realized_pnl = precalculated_realized_pnl
-            else:
-                realized_pnl = sum(e['pnl'] for e in events if e['type'] == 'trade')
-            initial_capital = account_value - realized_pnl
-            quality = 'standard'
-
-        if initial_capital <= 0:
-            initial_capital = max(account_value, 100)
-            quality = 'estimated'
-
-        # 4. 构建权益曲线（考虑出入金）
-        # 核心思想：
-        # - running_equity 追踪当前权益
-        # - peak 追踪历史最高权益
-        # - 出入金调整权益和峰值，但不产生回撤
-        # - 只有交易盈亏才会产生回撤
-
-        running_equity = 0.0  # 从0开始，通过出入金和交易累积
-        peak = 0.0
-        max_drawdown = 0.0
-        drawdown_count = 0
-        in_drawdown = False
-        largest_dd = 0.0
-
-        equity_curve = []
-
-        for event in events:
-            if event['type'] == 'cash_flow':
-                # 出入金事件：同时调整权益和峰值
-                cash_flow = event['amount']
-                running_equity += cash_flow
-
-                # 关键：出入金同步调整峰值
-                # 这样提现后，峰值降低，不会产生虚假回撤
-                if cash_flow > 0:
-                    # 充值：峰值增加
-                    peak += cash_flow
-                else:
-                    # 提现：峰值减少
-                    # 如果提现后权益仍高于调整后的峰值，更新峰值
-                    peak += cash_flow
-                    if running_equity > peak:
-                        peak = running_equity
-
-            elif event['type'] == 'trade':
-                # 交易事件：产生盈亏，可能产生回撤
-                pnl = event['pnl']
-                running_equity += pnl
-
-                # 计算回撤（在更新峰值之前）
-                if peak > 0 and running_equity < peak:
-                    drawdown = (peak - running_equity) / peak
-
-                    if not in_drawdown and drawdown > 0.01:  # 超过1%才算回撤
-                        drawdown_count += 1
-                        in_drawdown = True
-
-                    max_drawdown = max(max_drawdown, drawdown)
-                    largest_dd = max(largest_dd, drawdown)
-                elif running_equity < 0 and peak > 0:
-                    # 爆仓情况
-                    max_drawdown = max(max_drawdown, 1.0)
-                    largest_dd = max(largest_dd, 1.0)
-
-                # 更新峰值（在计算回撤之后）
-                if running_equity > peak:
-                    peak = running_equity
-                    # 从回撤中恢复
-                    if in_drawdown:
-                        in_drawdown = False
-
-            equity_curve.append({
-                'time': event['time'],
-                'equity': running_equity,
-                'peak': peak,
-                'drawdown': (peak - running_equity) / peak if peak > 0 else 0,
-                'event_type': event['type']
-            })
-
-        # 5. 计算含未实现盈亏的回撤（P1优化）
-        max_drawdown_with_unrealized = max_drawdown  # 默认与已实现相同
-
-        if state:
-            # 获取未实现盈亏
-            unrealized_pnl = sum(
-                float(pos['position'].get('unrealizedPnl', 0))
-                for pos in state.get('assetPositions', [])
-            )
-
-            # 在当前权益上加上未实现盈亏，看是否产生更大的回撤
-            if unrealized_pnl != 0:
-                current_equity_with_unrealized = running_equity + unrealized_pnl
-
-                # 计算含未实现的回撤
-                if peak > 0 and current_equity_with_unrealized < peak:
-                    drawdown_with_unrealized = (peak - current_equity_with_unrealized) / peak
-                    max_drawdown_with_unrealized = max(max_drawdown, drawdown_with_unrealized)
-                elif current_equity_with_unrealized < 0 and peak > 0:
-                    # 爆仓情况
-                    max_drawdown_with_unrealized = 1.0
-
-                logger.debug(
-                    f"未实现盈亏影响：当前权益=${running_equity:.2f}, "
-                    f"未实现=${unrealized_pnl:.2f}, "
-                    f"含未实现回撤={max_drawdown_with_unrealized*100:.2f}%"
-                )
-
-        # 6. 计算旧算法对比
-        legacy_dd, _ = cls._calculate_dd_legacy(fills, account_value, actual_initial_capital)
-
-        # 7. 返回详细信息
-        max_drawdown_pct = min(max_drawdown * 100, 999.99)
-        largest_dd_pct = min(largest_dd * 100, 999.99)
-        max_drawdown_with_unrealized_pct = min(max_drawdown_with_unrealized * 100, 999.99)
-
-        details = {
-            'max_drawdown': max_drawdown_pct,
-            'max_drawdown_legacy': legacy_dd,
-            'quality': quality,
-            'drawdown_count': drawdown_count,
-            'largest_drawdown_pct': largest_dd_pct,
-            'improvement_pct': legacy_dd - max_drawdown_pct if legacy_dd > max_drawdown_pct else 0.0,
-            'max_drawdown_with_unrealized': max_drawdown_with_unrealized_pct,  # P1新增
-            'equity_curve': equity_curve  # P2新增：用于回撤期间分析
-        }
-
-        # 日志记录改进效果
-        if details['improvement_pct'] > 5:
-            logger.info(
-                f"回撤算法改进：旧算法={legacy_dd:.2f}%, "
-                f"新算法={max_drawdown_pct:.2f}%, "
-                f"改进={details['improvement_pct']:.2f}%"
-            )
-
-        return max_drawdown_pct, details
-
-    @classmethod
-    def analyze_drawdown_periods(
-        cls,
-        equity_curve: List[Dict],
-        fills: List[Dict]
-    ) -> Dict:
-        """
-        分析回撤期间详情（P2优化）
-
-        识别所有回撤期间，计算恢复时间，分析回撤原因
-
-        Args:
-            equity_curve: 权益曲线数据
-            fills: 交易记录列表
-
-        Returns:
-            回撤期间分析详情
-        """
-        if not equity_curve:
-            return {
-                'periods': [],
-                'total_periods': 0,
-                'avg_duration_days': 0.0,
-                'avg_recovery_days': 0.0,
-                'longest_duration_days': 0,
-                'current_in_drawdown': False
-            }
-
-        # 1. 识别回撤期间
-        periods = []
-        current_period = None
-        previous_peak = 0.0
-        previous_peak_time = 0
-
-        for i, point in enumerate(equity_curve):
-            equity = point['equity']
-            peak = point['peak']
-            time = point['time']
-            drawdown = point['drawdown']
-
-            # 检测回撤开始
-            if drawdown > 0.01 and current_period is None:  # 超过1%开始记录
-                current_period = {
-                    'start_time': time,
-                    'start_equity': equity,
-                    'peak_value': peak,
-                    'peak_time': previous_peak_time,
-                    'trough_value': equity,
-                    'trough_time': time,
-                    'max_drawdown_pct': drawdown * 100,
-                    'recovered': False,
-                    'recovery_time': None,
-                    'duration_days': 0,
-                    'recovery_days': 0
-                }
-
-            # 更新回撤期间的谷底
-            if current_period and equity < current_period['trough_value']:
-                current_period['trough_value'] = equity
-                current_period['trough_time'] = time
-                current_period['max_drawdown_pct'] = drawdown * 100
-
-            # 检测回撤结束（恢复到峰值）
-            if current_period and equity >= current_period['peak_value']:
-                current_period['recovered'] = True
-                current_period['recovery_time'] = time
-
-                # 计算持续时间
-                duration_ms = current_period['trough_time'] - current_period['start_time']
-                current_period['duration_days'] = duration_ms / (1000 * 86400)
-
-                # 计算恢复时间
-                recovery_ms = time - current_period['trough_time']
-                current_period['recovery_days'] = recovery_ms / (1000 * 86400)
-
-                periods.append(current_period)
-                current_period = None
-
-            # 更新峰值
-            if equity > previous_peak:
-                previous_peak = equity
-                previous_peak_time = time
-
-        # 处理未恢复的回撤
-        if current_period:
-            current_period['recovered'] = False
-            duration_ms = current_period['trough_time'] - current_period['start_time']
-            current_period['duration_days'] = duration_ms / (1000 * 86400)
-            current_period['recovery_days'] = 0
-            periods.append(current_period)
-
-        # 2. 统计分析
-        total_periods = len(periods)
-        current_in_drawdown = current_period is not None
-
-        if total_periods > 0:
-            # 平均回撤持续天数
-            avg_duration = sum(p['duration_days'] for p in periods) / total_periods
-
-            # 平均恢复天数（只统计已恢复的）
-            recovered_periods = [p for p in periods if p['recovered']]
-            avg_recovery = (
-                sum(p['recovery_days'] for p in recovered_periods) / len(recovered_periods)
-                if recovered_periods else 0.0
-            )
-
-            # 最长回撤持续天数
-            longest_duration = max(p['duration_days'] for p in periods)
-        else:
-            avg_duration = 0.0
-            avg_recovery = 0.0
-            longest_duration = 0
-
-        # 3. 为每个回撤期间添加交易统计
-        for period in periods:
-            # 确定期间结束时间
-            end_time = period.get('recovery_time') if period.get('recovered') else period.get('trough_time', 0)
-            if end_time is None:
-                end_time = period.get('trough_time', 0)
-
-            period_fills = [
-                f for f in fills
-                if period['start_time'] <= f.get('time', 0) <= end_time
-            ]
-
-            if period_fills:
-                losing_trades = [f for f in period_fills if MetricsEngine._get_pnl(f) < 0]
-                period['trades_count'] = len(period_fills)
-                period['losing_trades_count'] = len(losing_trades)
-                period['total_loss'] = sum(MetricsEngine._get_pnl(f) for f in losing_trades)
-            else:
-                period['trades_count'] = 0
-                period['losing_trades_count'] = 0
-                period['total_loss'] = 0.0
-
-        return {
-            'periods': periods,
-            'total_periods': total_periods,
-            'avg_duration_days': avg_duration,
-            'avg_recovery_days': avg_recovery,
-            'longest_duration_days': int(longest_duration),
-            'current_in_drawdown': current_in_drawdown
-        }
-
     @staticmethod
     def calculate_trade_statistics(fills: List[Dict]) -> tuple[float, float]:
         """
@@ -1505,12 +985,11 @@ class MetricsEngine:
                 win_rate=0.0,
                 roi=0.0,
                 total_pnl=0.0,
-                max_drawdown=0.0,
                 avg_trade_size=0.0,
                 total_volume=0.0,
                 first_trade_time=0,
                 last_trade_time=0,
-                active_days=0
+                active_days=0,
             )
 
         # 直接计算总账户价值
@@ -1711,23 +1190,6 @@ class MetricsEngine:
 
         # ========== P1性能优化：传递预计算数据给各指标计算方法 ==========
 
-        # 计算最大回撤（使用改进算法，如果有ledger数据）
-        # P1优化：传递预计算的 events, realized_pnl, sorted_fills
-        max_drawdown, dd_details = cls.calculate_max_drawdown(
-            fills, account_value, actual_initial, ledger_data, address, state,
-            precalculated_events=events,
-            precalculated_realized_pnl=realized_pnl,
-            precalculated_sorted_fills=sorted_fills
-        )
-
-        # 回撤期间详细分析（P2优化）
-        dd_periods_analysis = {'total_periods': 0, 'avg_duration_days': 0.0, 'avg_recovery_days': 0.0, 'longest_duration_days': 0, 'current_in_drawdown': False}
-        if 'equity_curve' in dd_details and dd_details['equity_curve']:
-            dd_periods_analysis = cls.analyze_drawdown_periods(
-                dd_details['equity_curve'],
-                fills
-            )
-
         # 检测爆仓次数
         # P1优化：传递预计算的 realized_pnl, sorted_fills
         bankruptcy_count = cls.detect_bankruptcy(
@@ -1752,7 +1214,6 @@ class MetricsEngine:
             total_trades=len(fills),
             win_rate=win_rate,
             total_pnl=total_pnl,
-            max_drawdown=max_drawdown,
             avg_trade_size=avg_trade_size,
             total_volume=total_volume,
             first_trade_time=first_trade_time,
@@ -1770,14 +1231,6 @@ class MetricsEngine:
             true_capital_roi=true_capital_roi,
             # P0 修复字段
             bankruptcy_count=bankruptcy_count,
-            # 回撤详细信息（P0优化）
-            max_drawdown_legacy=dd_details.get('max_drawdown_legacy', max_drawdown),
-            drawdown_quality=dd_details.get('quality', 'estimated'),
-            drawdown_count=dd_details.get('drawdown_count', 0),
-            largest_drawdown_pct=dd_details.get('largest_drawdown_pct', max_drawdown),
-            drawdown_improvement_pct=dd_details.get('improvement_pct', 0.0),
-            # 未实现盈亏回撤（P1优化）
-            max_drawdown_with_unrealized=dd_details.get('max_drawdown_with_unrealized', max_drawdown),
             # ROI扩展指标（P1优化）
             time_weighted_roi=time_weighted_roi,
             annualized_roi=annualized_roi,
@@ -1785,10 +1238,4 @@ class MetricsEngine:
             roi_quality=roi_quality,
             # 累计收益率指标（新增）
             initial_capital_corrected=initial_capital_corrected,
-            # 回撤期间分析（P2优化）
-            drawdown_periods_count=dd_periods_analysis['total_periods'],
-            avg_drawdown_duration_days=dd_periods_analysis['avg_duration_days'],
-            avg_recovery_days=dd_periods_analysis['avg_recovery_days'],
-            longest_drawdown_days=dd_periods_analysis['longest_duration_days'],
-            current_in_drawdown=dd_periods_analysis['current_in_drawdown']
         )
