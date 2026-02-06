@@ -22,7 +22,7 @@ import logging
 import argparse
 import threading
 from datetime import datetime
-from typing import Any, List, Dict, Set, Optional
+from typing import Any, List, Dict, Set
 
 # 添加项目根目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -260,24 +260,6 @@ class MultiConnectionManager:
                 t.join(timeout=2.0)
 
         print(f"\n✅ 所有连接已停止\n")
-
-    def get_stats(self) -> Dict[str, Any]:
-        """获取连接池统计信息"""
-        stats = {
-            "total_connections": len(self.managers),
-            "total_users": len(self.addresses),
-            "connection_states": {},
-            "managers": []
-        }
-
-        for idx, manager in enumerate(self.managers):
-            with self._lock:
-                state = self._connection_states.get(idx, ConnectionState.DISCONNECTED)
-
-            stats["connection_states"][f"pool_{idx + 1}"] = state.value
-            stats["managers"].append(manager.get_stats())
-
-        return stats
 
 
 # ==================== 配置区 ====================
@@ -538,7 +520,6 @@ def handle_user_fills(data: Any) -> None:
         return
 
     # userFills 返回格式: {"isSnapshot": bool, "user": str, "fills": [...]}
-    is_snapshot = data.get("isSnapshot", False)
     user = data.get("user", "")
     fills = data.get("fills", [])
 
@@ -557,16 +538,8 @@ def handle_user_fills(data: Any) -> None:
         return
 
     fills = new_fills[-1:]  # 只显示最新一条
-    # 获取地址编号和格式化显示
-    addr_idx = get_address_index(user)
-    addr_display = format_address(user)
-    idx_tag = f"[#{addr_idx}]" if addr_idx > 0 else ""
-
-    snapshot_tag = " [快照]" if is_snapshot else ""
     print("\n" + "═" * 100)
-    # print(f"💰 用户成交{snapshot_tag} {idx_tag} {addr_display}")
     print(f"   地址: {user}")
-    # print(f"   共 {len(fills)} 笔成交")
     print("═" * 100)
 
     for idx, fill in enumerate(fills, 1):

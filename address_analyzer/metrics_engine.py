@@ -91,8 +91,6 @@ class MetricsEngine:
     def _collect_metrics_data(
         cls,
         fills: List[Dict],
-        ledger: Optional[List[Dict]] = None,
-        address: Optional[str] = None
     ) -> Dict:
         """
         单次遍历收集所有指标计算所需的数据
@@ -102,8 +100,6 @@ class MetricsEngine:
 
         Args:
             fills: 交易记录列表
-            ledger: 出入金记录（可选）
-            address: 用户地址（使用 ledger 时需要）
 
         Returns:
             包含所有预计算数据的字典
@@ -114,34 +110,21 @@ class MetricsEngine:
                 'realized_pnl': 0.0,
                 'winning_trades': 0,
                 'losing_trades': 0,
-                'zero_pnl_trades': 0,
                 'total_volume': 0.0,
                 'avg_trade_size': 0.0,
                 'first_trade_time': 0,
                 'last_trade_time': 0,
-                'trading_dates': set(),
                 'active_days': 0,
-                'pnl_sequence': [],
-                'time_sequence': [],
-                'events': [],
                 'sorted_fills': [],
-                'is_sorted': True,
-                'total_wins': 0.0,
-                'total_losses': 0.0
             }
 
         # 初始化计数器和累加器
         realized_pnl = 0.0
         winning_trades = 0
         losing_trades = 0
-        zero_pnl_trades = 0
         total_volume = 0.0
-        total_wins = 0.0
-        total_losses = 0.0
         trading_dates = set()
-        pnl_sequence = []
         time_sequence = []
-        events = []
 
         # 排序检测
         is_sorted = True
@@ -156,12 +139,8 @@ class MetricsEngine:
             realized_pnl += pnl
             if pnl > 0:
                 winning_trades += 1
-                total_wins += pnl
             elif pnl < 0:
                 losing_trades += 1
-                total_losses += abs(pnl)
-            else:
-                zero_pnl_trades += 1
 
             # 2. 交易量
             price = float(fill.get('px', 0))
@@ -185,41 +164,16 @@ class MetricsEngine:
             elif isinstance(time_val, int) and time_val > 0:
                 trading_dates.add(datetime.fromtimestamp(time_val / 1000).date())
 
-            # 5. 序列数据
-            pnl_sequence.append(pnl)
+            # 5. 时间序列
             time_sequence.append(time_val)
-
-            # 6. Events 构建（用于回撤等计算）
-            events.append({
-                'time': time_val,
-                'type': 'trade',
-                'pnl': pnl
-            })
-
-        # 添加出入金事件
-        if ledger and address:
-            for record in ledger:
-                amount = cls._extract_ledger_amount(record, address)
-                if amount != 0:
-                    events.append({
-                        'time': record.get('time', 0),
-                        'type': 'cash_flow',
-                        'amount': amount
-                    })
 
         # 排序处理
         if not is_sorted:
             sorted_fills = sorted(fills, key=lambda x: x.get('time', 0))
-            # 重建序列数据
-            pnl_sequence = [cls._get_pnl(f) for f in sorted_fills]
             time_sequence = [f.get('time', 0) for f in sorted_fills]
             logger.debug("检测到未排序数据，已执行排序")
         else:
             sorted_fills = fills
-
-        # 对 events 排序
-        events.sort(key=lambda x: x['time'] if not isinstance(x['time'], datetime)
-                    else x['time'].timestamp() * 1000)
 
         # 计算派生指标
         total_trades = len(fills)
@@ -232,20 +186,12 @@ class MetricsEngine:
             'realized_pnl': realized_pnl,
             'winning_trades': winning_trades,
             'losing_trades': losing_trades,
-            'zero_pnl_trades': zero_pnl_trades,
             'total_volume': total_volume,
             'avg_trade_size': avg_trade_size,
             'first_trade_time': first_trade_time,
             'last_trade_time': last_trade_time,
-            'trading_dates': trading_dates,
             'active_days': len(trading_dates),
-            'pnl_sequence': pnl_sequence,
-            'time_sequence': time_sequence,
-            'events': events,
             'sorted_fills': sorted_fills,
-            'is_sorted': is_sorted,
-            'total_wins': total_wins,
-            'total_losses': total_losses
         }
 
     @staticmethod
@@ -693,7 +639,6 @@ class MetricsEngine:
                 address=address,
                 total_trades=0,
                 win_rate=0.0,
-                roi=0.0,
                 total_pnl=0.0,
                 avg_trade_size=0.0,
                 total_volume=0.0,
@@ -742,18 +687,16 @@ class MetricsEngine:
 
         # ========== P1性能优化：单次遍历收集所有数据 ==========
         ledger_data = transfer_data.get('ledger', None) if transfer_data else None
-        collected = cls._collect_metrics_data(fills, ledger_data, address)
+        collected = cls._collect_metrics_data(fills)
 
         # 从预收集数据中提取指标
         realized_pnl = collected['realized_pnl']
         winning_trades = collected['winning_trades']
         losing_trades = collected['losing_trades']
-        zero_pnl_trades = collected['zero_pnl_trades']
         total_volume = collected['total_volume']
         avg_trade_size = collected['avg_trade_size']
         active_days = collected['active_days']
         sorted_fills = collected['sorted_fills']
-        events = collected['events']
         first_trade_time = collected['first_trade_time']
         last_trade_time = collected['last_trade_time']
 
@@ -889,13 +832,11 @@ class MetricsEngine:
         # 计算校正后的账户初始值（包含外部转入到 Spot）
         # P1优化：ledger_data 已在前面提取
         if ledger_data and has_transfer_data:
-            initial_capital_corrected, external_to_spot, external_out = cls.calculate_initial_capital_corrected(
+            initial_capital_corrected, _, _ = cls.calculate_initial_capital_corrected(
                 address, ledger_data, total_deposits, total_withdrawals
             )
         else:
             initial_capital_corrected = true_capital
-            external_to_spot = 0.0
-            external_out = 0.0
 
 
         # ========== P1性能优化：传递预计算数据给各指标计算方法 ==========

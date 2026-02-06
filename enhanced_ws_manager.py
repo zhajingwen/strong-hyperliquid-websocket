@@ -272,16 +272,6 @@ class ReconnectionManager:
         self.retry_count = 0
         self.last_attempt_time = 0.0
 
-    def get_stats(self) -> Dict[str, Any]:
-        """获取重连统计"""
-        return {
-            "retry_count": self.retry_count,
-            "max_retries": self.max_retries,
-            "last_attempt_time": self.last_attempt_time,
-            "next_delay": self.get_delay(),
-        }
-
-
 class EnhancedWebSocketManager:
     """
     增强的 WebSocket 连接管理器
@@ -823,16 +813,3 @@ class EnhancedWebSocketManager:
             f"{'='*60}\n"
         )
 
-    def get_stats(self) -> Dict[str, Any]:
-        """
-        获取完整统计信息
-
-        Returns:
-            统计信息字典
-        """
-        return {
-            "state": self.state.value,
-            "health_report": self.health_monitor.get_health_report(),
-            "reconnection_stats": self.reconnection_manager.get_stats(),
-            "subscription_count": len(self._active_subscriptions),
-        }
