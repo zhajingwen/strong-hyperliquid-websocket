@@ -704,37 +704,6 @@ class HyperliquidAPIClient:
             'ledger': ledger
         }
 
-    async def batch_fetch_addresses(
-        self,
-        addresses: List[str],
-        progress_callback: Optional[callable] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        批量获取多个地址的数据
-
-        Args:
-            addresses: 地址列表
-            progress_callback: 进度回调函数
-
-        Returns:
-            数据列表
-        """
-        tasks = []
-        for i, addr in enumerate(addresses):
-            task = self.fetch_address_data(addr)
-            tasks.append(task)
-
-        results = []
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            result = await coro
-            results.append(result)
-
-            # 进度回调
-            if progress_callback:
-                progress_callback(i + 1, len(addresses))
-
-        return results
-
     def get_stats(self) -> Dict:
         """
         获取统计信息

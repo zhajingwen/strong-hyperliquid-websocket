@@ -6,7 +6,6 @@ import logging
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from datetime import datetime
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +38,6 @@ class AddressMetrics:
 
     # P0 修复新增字段
     bankruptcy_count: int = 0           # 爆仓次数
-    has_recent_liquidation: bool = False  # 最近1周是否有爆仓记录
-
     # ROI 扩展指标（P1优化新增）
     time_weighted_roi: float = 0.0         # 时间加权ROI（考虑资金使用时长）
     annualized_roi: float = 0.0            # 年化ROI
@@ -53,36 +50,6 @@ class AddressMetrics:
 
 class MetricsEngine:
     """交易指标计算引擎"""
-
-    ANNUAL_DAYS = 365  # 加密货币全年交易，不使用252交易日
-    DEFAULT_RISK_FREE_RATE = 0.04  # 默认无风险利率 4%（2024年市场水平）
-    _risk_free_rate = DEFAULT_RISK_FREE_RATE  # 类变量，可动态修改
-
-    @classmethod
-    def set_risk_free_rate(cls, rate: float):
-        """
-        设置无风险利率
-
-        Args:
-            rate: 年化无风险利率（0-20%范围）
-
-        Raises:
-            ValueError: 如果利率超出合理范围
-        """
-        if not 0 <= rate <= 0.20:
-            raise ValueError(f"利率超出合理范围 (0-20%): {rate}")
-        cls._risk_free_rate = rate
-        logger.info(f"无风险利率更新为: {rate:.2%}")
-
-    @classmethod
-    def get_risk_free_rate(cls) -> float:
-        """
-        获取当前无风险利率
-
-        Returns:
-            当前无风险利率
-        """
-        return cls._risk_free_rate
 
     @staticmethod
     def _get_pnl(fill: Dict) -> float:
@@ -282,59 +249,6 @@ class MetricsEngine:
         }
 
     @staticmethod
-    def calculate_win_rate(fills: List[Dict]) -> float:
-        """
-        计算胜率（改进版：排除零PNL交易）
-
-        算法改进：
-        - 只统计有盈亏的交易（排除零PNL交易）
-        - 零PNL通常是：开仓、部分平仓、手续费抵消等
-        - 将零PNL算作失败交易不合理
-        - 符合交易分析行业标准（参考Apex Liquid Bot算法）
-
-        Args:
-            fills: 交易记录列表
-
-        Returns:
-            胜率百分比 (0-100)
-
-        Examples:
-            >>> # 假设有5笔交易：2盈利、1亏损、2零PNL（开仓）
-            >>> fills = [
-            ...     {'closedPnl': 100},   # 盈利
-            ...     {'closedPnl': -50},   # 亏损
-            ...     {'closedPnl': 0},     # 开仓（零PNL）
-            ...     {'closedPnl': 0},     # 开仓（零PNL）
-            ...     {'closedPnl': 200},   # 盈利
-            ... ]
-            >>> # 旧算法：2/5 = 40%（不合理）
-            >>> # 新算法：2/3 = 66.67%（排除零PNL，更准确）
-        """
-        if not fills:
-            return 0.0
-
-        # 统计有盈亏的交易
-        winning_trades = 0
-        total_pnl_trades = 0
-
-        for fill in fills:
-            pnl = MetricsEngine._get_pnl(fill)
-            # 排除零PNL交易（开仓、部分平仓等）
-            if pnl != 0:
-                total_pnl_trades += 1
-                if pnl > 0:
-                    winning_trades += 1
-
-        # 没有有效交易时返回0
-        if total_pnl_trades == 0:
-            return 0.0
-
-        win_rate = (winning_trades / total_pnl_trades) * 100
-
-        # 边界保护：胜率应该在 0-100 之间
-        return max(0.0, min(100.0, win_rate))
-
-    @staticmethod
     def calculate_actual_initial_capital(
         account_value: float,
         realized_pnl: float,
@@ -378,71 +292,6 @@ class MetricsEngine:
                 return conservative
 
         return actual_initial
-
-    @staticmethod
-    def calculate_pnl_and_roi(
-        fills: List[Dict],
-        account_value: float,
-        net_deposits: float = 0.0,
-        has_transfer_data: bool = False,
-        true_capital: Optional[float] = None
-    ) -> tuple[float, float, float]:
-        """
-        计算总PNL和真实本金ROI
-
-        总PNL = 所有交易的已实现PNL之和 (sum of closedPnl)
-        True Capital ROI = (已实现PNL / 真实本金) * 100 - 保守方法（仅充值/提现）
-
-        Args:
-            fills: 交易记录列表
-            account_value: 当前账户价值
-            net_deposits: 净充值（默认0）- 传统方法，包含转账
-            has_transfer_data: 是否有出入金数据
-            true_capital: 真实本金（仅充值/提现，不含转账）
-
-        Returns:
-            (total_pnl, actual_initial_capital, true_capital_roi)
-        """
-        if not fills:
-            return 0.0, 0.0, 0.0
-
-        # 计算已实现PNL（所有交易的closedPnl总和）
-        realized_pnl = sum(MetricsEngine._get_pnl(fill) for fill in fills)
-        total_pnl = realized_pnl
-
-        # 计算推算的初始资金（用于降级策略）
-        estimated_initial = account_value - realized_pnl
-
-        # 如果有出入金数据，计算真实初始资金
-        if has_transfer_data:
-            # 传统方法：包含转账的初始资金
-            actual_initial = MetricsEngine.calculate_actual_initial_capital(
-                account_value, realized_pnl, net_deposits
-            )
-
-            # 保守方法：基于真实本金（仅充值/提现）
-            if true_capital is not None and true_capital > 0:
-                # 计算真实本金ROI
-                true_capital_roi = (realized_pnl / true_capital) * 100
-                # 边界保护
-                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
-            else:
-                # 如果没有真实本金数据，使用实际初始资金
-                if actual_initial > 0:
-                    true_capital_roi = (realized_pnl / actual_initial) * 100
-                    true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
-                else:
-                    true_capital_roi = 0.0
-        else:
-            # 降级策略：使用推算的初始资金
-            actual_initial = estimated_initial
-            if estimated_initial > 0:
-                true_capital_roi = (realized_pnl / estimated_initial) * 100
-                true_capital_roi = max(-999999.99, min(999999.99, true_capital_roi))
-            else:
-                true_capital_roi = 0.0
-
-        return total_pnl, actual_initial, true_capital_roi
 
     @classmethod
     def calculate_time_weighted_roi(
@@ -691,145 +540,6 @@ class MetricsEngine:
                 return -amount
 
         return 0.0
-
-    @staticmethod
-    def calculate_trade_statistics(fills: List[Dict]) -> tuple[float, float]:
-        """
-        计算交易统计信息
-
-        Args:
-            fills: 交易记录列表
-
-        Returns:
-            (avg_trade_size, total_volume)
-        """
-        if not fills:
-            return 0.0, 0.0
-
-        # 平均交易规模（以USD计）
-        trade_sizes = []
-        total_volume = 0.0
-
-        for fill in fills:
-            price = float(fill.get('px', 0))
-            size = float(fill.get('sz', 0))
-            volume = price * size
-            trade_sizes.append(volume)
-            total_volume += volume
-
-        avg_trade_size = sum(trade_sizes) / len(trade_sizes) if trade_sizes else 0.0
-
-        return avg_trade_size, total_volume
-
-    @staticmethod
-    def calculate_win_rate_detailed(fills: List[Dict]) -> Dict[str, float]:
-        """
-        计算详细的胜率统计信息（增强版）
-
-        提供更全面的交易分析数据，包括：
-        - 胜率（排除零PNL）
-        - 盈利/亏损交易数量
-        - 平均盈利/亏损金额
-        - 盈亏比（平均盈利/平均亏损）
-
-        Args:
-            fills: 交易记录列表
-
-        Returns:
-            详细统计字典：
-            {
-                'win_rate': 胜率百分比,
-                'total_trades': 总交易数,
-                'winning_trades': 盈利交易数,
-                'losing_trades': 亏损交易数,
-                'zero_pnl_trades': 零PNL交易数,
-                'avg_win': 平均盈利金额,
-                'avg_loss': 平均亏损金额,
-                'profit_factor': 盈亏比（总盈利/总亏损）
-            }
-        """
-        if not fills:
-            return {
-                'win_rate': 0.0,
-                'total_trades': 0,
-                'winning_trades': 0,
-                'losing_trades': 0,
-                'zero_pnl_trades': 0,
-                'avg_win': 0.0,
-                'avg_loss': 0.0,
-                'profit_factor': 0.0
-            }
-
-        winning_trades = 0
-        losing_trades = 0
-        zero_pnl_trades = 0
-        total_wins = 0.0
-        total_losses = 0.0
-
-        for fill in fills:
-            pnl = MetricsEngine._get_pnl(fill)
-
-            if pnl > 0:
-                winning_trades += 1
-                total_wins += pnl
-            elif pnl < 0:
-                losing_trades += 1
-                total_losses += abs(pnl)
-            else:
-                zero_pnl_trades += 1
-
-        # 计算胜率（排除零PNL）
-        total_pnl_trades = winning_trades + losing_trades
-        win_rate = (winning_trades / total_pnl_trades * 100) if total_pnl_trades > 0 else 0.0
-
-        # 计算平均盈利/亏损
-        avg_win = total_wins / winning_trades if winning_trades > 0 else 0.0
-        avg_loss = total_losses / losing_trades if losing_trades > 0 else 0.0
-
-        # 计算盈亏比（Profit Factor）
-        profit_factor = total_wins / total_losses if total_losses > 0 else (float('inf') if total_wins > 0 else 0.0)
-
-        return {
-            'win_rate': max(0.0, min(100.0, win_rate)),
-            'total_trades': len(fills),
-            'winning_trades': winning_trades,
-            'losing_trades': losing_trades,
-            'zero_pnl_trades': zero_pnl_trades,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
-            'profit_factor': profit_factor if profit_factor != float('inf') else 1000.0
-        }
-
-    @staticmethod
-    def calculate_active_days(fills: List[Dict]) -> int:
-        """
-        计算活跃天数
-
-        Args:
-            fills: 交易记录列表
-
-        Returns:
-            活跃天数
-        """
-        if not fills:
-            return 0
-
-        # 提取所有交易日期（去重）
-        trading_dates = set()
-        for fill in fills:
-            time_value = fill.get('time', 0)
-
-            # 处理两种情况：毫秒时间戳（API）或 datetime 对象（数据库）
-            if isinstance(time_value, datetime):
-                date = time_value.date()
-            elif isinstance(time_value, int):
-                date = datetime.fromtimestamp(time_value / 1000).date()
-            else:
-                continue
-
-            trading_dates.add(date)
-
-        return len(trading_dates)
 
     @classmethod
     def detect_bankruptcy(

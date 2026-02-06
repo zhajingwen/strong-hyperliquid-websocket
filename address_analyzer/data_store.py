@@ -6,7 +6,7 @@ import os
 import json
 import logging
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import asyncpg
 from asyncpg.pool import Pool
 
@@ -1079,21 +1079,6 @@ class DataStore:
                 safe_metrics['net_deposit']
             )
 
-    async def get_all_metrics(self) -> List[Dict]:
-        """
-        获取所有已计算的指标
-
-        Returns:
-            指标列表
-        """
-        sql = """
-        SELECT * FROM metrics_cache
-        ORDER BY total_pnl DESC
-        """
-
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(sql)
-            return [dict(row) for row in rows]
 
 
 # 单例模式

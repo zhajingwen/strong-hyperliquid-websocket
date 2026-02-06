@@ -288,8 +288,6 @@ async def analyze_pnl_corrected(address: str):
 
 
 if __name__ == '__main__':
-    import sys
-
     # 默认测试地址
     default_address = "0x324f74880ccee9a05282614d3f80c09831a36774"
 

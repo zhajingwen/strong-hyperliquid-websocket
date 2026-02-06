@@ -58,9 +58,6 @@ class DeduplicationCache:
         self._cache.add(key)
         self._order.append(key)
 
-    def size(self) -> int:
-        """返回当前缓存大小"""
-        return len(self._cache)
 
 
 # 去重缓存实例

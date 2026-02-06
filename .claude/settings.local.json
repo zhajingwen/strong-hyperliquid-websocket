@@ -34,7 +34,8 @@
       "Bash(docker exec:*)",
       "Bash(vulture:*)",
       "Bash(uv pip install:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(wc:*)"
     ]
   }
 }

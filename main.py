@@ -62,10 +62,6 @@ class DeduplicationCache:
         self._cache.add(key)
         self._order.append(key)
 
-    def size(self) -> int:
-        """返回当前缓存大小"""
-        return len(self._cache)
-
 # 去重缓存实例
 printed_trades = DeduplicationCache(max_size=10000)  # 交易去重
 printed_l2books = DeduplicationCache(max_size=1000)  # 订单簿去重（基于时间戳）
