@@ -17,9 +17,7 @@ class AddressMetrics:
     address: str
     total_trades: int
     win_rate: float          # 胜率 (%)
-    sharpe_ratio: float      # 夏普比率
     total_pnl: float         # 总PNL = 已实现PNL (USD)
-    account_value: float     # 账户价值 (USD) - Perp + Spot 总和
     max_drawdown: float      # 最大回撤 (%)
     avg_trade_size: float    # 平均交易规模
     total_volume: float      # 总交易量
@@ -42,7 +40,6 @@ class AddressMetrics:
 
     # P0 修复新增字段
     bankruptcy_count: int = 0           # 爆仓次数
-    sharpe_method: str = "standard"     # 计算方法标记
     has_recent_liquidation: bool = False  # 最近1周是否有爆仓记录
 
     # 回撤详细信息（P0优化新增）
@@ -63,11 +60,6 @@ class AddressMetrics:
 
     # 累计收益率指标（新增）
     initial_capital_corrected: float = 0.0 # 校正后的账户初始值（含外部转入）
-
-    # Sharpe比率扩展指标（P2优化新增）
-    sharpe_quality: str = "estimated"      # Sharpe质量：enhanced|standard|estimated|estimated_fallback
-    funding_pnl: float = 0.0               # 资金费率盈亏（USD）
-    funding_contribution: float = 0.0      # 资金费率贡献百分比（%）
 
     # 回撤期间分析（P2优化新增）
     drawdown_periods_count: int = 0        # 回撤期间总数
@@ -248,7 +240,7 @@ class MetricsEngine:
             pnl_sequence.append(pnl)
             time_sequence.append(time_val)
 
-            # 6. Events 构建（用于 Sharpe、回撤等计算）
+            # 6. Events 构建（用于回撤等计算）
             events.append({
                 'time': time_val,
                 'type': 'trade',
@@ -665,568 +657,6 @@ class MetricsEngine:
         total_roi = max(-999999.99, min(999999.99, total_roi))
 
         return time_weighted_roi, annualized_roi, total_roi, quality
-
-    @classmethod
-    def calculate_sharpe_ratio(
-        cls,
-        fills: List[Dict],
-        account_value: float,
-        actual_initial_capital: Optional[float] = None
-    ) -> float:
-        """
-        计算夏普比率（改进版：动态资金基准，考虑复利效应）
-
-        算法改进：
-        1. 使用动态资金基准（每笔交易后更新资金）
-        2. 考虑复利效应（盈利后资金增长，亏损后资金减少）
-        3. 更准确反映策略的真实风险收益特征
-        4. 支持真实初始资金（如果提供出入金数据）
-
-        Args:
-            fills: 交易记录列表（按时间排序）
-            account_value: 当前账户价值
-            actual_initial_capital: 实际初始资金（可选，有出入金数据时提供）
-
-        Returns:
-            夏普比率
-
-        算法说明：
-            旧算法问题：
-            - 使用固定资金基准，忽略资金变化
-            - 示例：初始1000美元，第1笔赚200，第2笔赚300
-              旧算法：ret1=200/1000=20%, ret2=300/1000=30%（错误）
-              新算法：ret1=200/1000=20%, ret2=300/1200=25%（正确）
-
-            新算法优势：
-            - 每笔交易基于当前实际资金计算收益率
-            - 符合复利交易的实际情况
-            - 更准确反映风险调整后的收益
-        """
-        if not fills or len(fills) < 2:
-            return 0.0
-
-        # 确定初始资金：优先使用真实初始资金，否则推算
-        if actual_initial_capital is not None and actual_initial_capital > 0:
-            initial_capital = actual_initial_capital
-        else:
-            realized_pnl = sum(MetricsEngine._get_pnl(f) for f in fills)
-            initial_capital = account_value - realized_pnl
-
-        # 边界保护：初始资金不应为负或过小
-        if initial_capital <= 0:
-            initial_capital = max(account_value, 1000)  # 最低1K
-        else:
-            initial_capital = max(initial_capital, 100)  # 最低100美元
-
-        # 按时间排序（带优化检测）
-        sorted_fills = cls._ensure_sorted_fills(fills)
-
-        # 计算每笔交易的收益率（动态资金基准）
-        returns = []
-        running_capital = initial_capital
-        bankruptcy_detected = False
-
-        for fill in sorted_fills:
-            pnl = MetricsEngine._get_pnl(fill)
-
-            if running_capital > 0 and not bankruptcy_detected:
-                ret = pnl / running_capital
-                returns.append(ret)
-                running_capital += pnl
-
-                # 爆仓检测 - 终止计算而非重置
-                if running_capital <= 0:
-                    logger.warning(
-                        f"检测到爆仓: 资金 {running_capital - pnl:.2f} → {running_capital:.2f}, "
-                        f"在第 {len(returns)} 笔交易后终止 Sharpe 计算"
-                    )
-                    bankruptcy_detected = True
-                    break  # 终止，不再处理后续交易
-            else:
-                # 已爆仓或资金为负，跳过所有后续交易
-                continue
-
-        if not returns or len(returns) < 2:
-            return 0.0
-
-        # 转换为 numpy 数组
-        returns_array = np.array(returns)
-
-        # 计算平均收益率和标准差（贝塞尔校正）
-        mean_return = np.mean(returns_array)
-        std_return = np.std(returns_array, ddof=1)
-
-        if std_return == 0:
-            return 0.0
-
-        # 计算时间跨度
-        trading_days = len(returns)
-        first_time = sorted_fills[0]['time']
-        last_time = sorted_fills[-1]['time']
-
-        if isinstance(first_time, datetime) and isinstance(last_time, datetime):
-            # 数据库格式：datetime 对象
-            time_span_days = (last_time - first_time).total_seconds() / 86400
-        else:
-            # API 格式：毫秒时间戳
-            time_span_days = (last_time - first_time) / (1000 * 86400)
-
-        # 避免除零
-        if time_span_days <= 0:
-            time_span_days = 1
-
-        # 使用改进的年化算法（基于实际时间跨度）
-        if trading_days > 0 and time_span_days > 0:
-            # 方法：基于实际持有期计算年化
-            # 1. 计算总收益率
-            total_return = np.sum(returns_array)  # 简单相加（保守）
-
-            # 2. 转换为年化收益率（基于实际天数）
-            years = time_span_days / MetricsEngine.ANNUAL_DAYS
-            if years > 0:
-                # 🛡️ 年化公式: (1 + 总收益)^(1/年数) - 1
-                # 添加防护：防止数学溢出和无效值
-
-                # 防护1：爆仓场景（total_return <= -1）
-                if total_return <= -1:
-                    annual_return = -0.9999  # 限制为 -99.99%
-                    logger.warning(f"年化ROI过低 ({total_return*100:.2f}%)，限制为-99.99%")
-                else:
-                    try:
-                        # 防护2：确保底数 > 0（避免负数的非整数次幂）
-                        base = max(1 + total_return, 0.0001)
-                        exponent = 1 / years
-
-                        # 防护3：预检查防止指数爆炸（base^exponent 可能溢出）
-                        # 当 base > 1 且 exponent > 100 时，结果会非常大
-                        if base > 1 and exponent > 100:
-                            # log(base^exponent) = exponent * log(base)
-                            # 如果 exponent * log(base) > 230，结果会溢出
-                            log_result = exponent * np.log(base)
-                            if log_result > 230:  # e^230 ≈ 10^100
-                                annual_return = 100.0  # 限制为 10000%
-                                logger.warning(
-                                    f"[Enhanced] 年化收益率过大: "
-                                    f"base={base:.4f}, exponent={exponent:.2f}, "
-                                    f"限制为 ±10000%"
-                                )
-                            else:
-                                annual_return = base ** exponent - 1
-                        else:
-                            annual_return = base ** exponent - 1
-
-                        # 防护4：钳制最终结果到合理范围
-                        MAX_ANNUAL_RETURN = 100.0  # 10000%
-                        if annual_return > MAX_ANNUAL_RETURN:
-                            logger.warning(
-                                f"[Enhanced] 年化收益率过大: {annual_return*100:.2f}%, "
-                                f"限制为 ±{MAX_ANNUAL_RETURN*100:.0f}%"
-                            )
-                            annual_return = MAX_ANNUAL_RETURN
-                        elif annual_return < -0.9999:
-                            annual_return = -0.9999
-
-                    except (OverflowError, ValueError, FloatingPointError) as e:
-                        logger.error(f"年化收益率计算异常: {type(e).__name__}: {e}")
-                        annual_return = 0.0
-            else:
-                annual_return = 0.0
-
-            # 3. 年化标准差（修复版：使用更稳健的方法）
-            # 计算平均每笔交易的时间间隔（天）
-            avg_days_per_trade = time_span_days / max(trading_days - 1, 1)
-
-            # 方法A：基于交易频率的年化标准差（推荐）
-            # 假设：年化波动 = 单笔交易波动 × sqrt(年交易次数)
-            trades_per_year = MetricsEngine.ANNUAL_DAYS / avg_days_per_trade
-            annual_std = std_return * np.sqrt(trades_per_year)
-
-            # 方法B（备选）：基于时间加权的年化标准差
-            # annual_std = std_return * np.sqrt(MetricsEngine.ANNUAL_DAYS / avg_days_per_trade)
-
-            # 🛡️ 强化异常值保护
-            # 1. 检查 annual_std 是否过小（可能导致 Sharpe 虚高）
-            MIN_ANNUAL_STD = 0.01  # 最小年化标准差 1%
-            if annual_std < MIN_ANNUAL_STD:
-                logger.warning(
-                    f"年化标准差过小: {annual_std:.6f}, "
-                    f"调整为最小值 {MIN_ANNUAL_STD:.2%}"
-                )
-                annual_std = MIN_ANNUAL_STD
-
-            # 2. 检查是否为 NaN 或 Inf
-            if np.isnan(annual_return) or np.isinf(annual_return):
-                logger.warning(f"年化收益率异常: {annual_return}")
-                annual_return = 0.0
-            if np.isnan(annual_std) or np.isinf(annual_std):
-                logger.warning(f"年化标准差异常: {annual_std}")
-                annual_std = 1.0
-
-            # 3. 检查年化标准差是否合理（应在 1%-500% 范围内）
-            if annual_std > 5.0:  # >500%
-                logger.warning(
-                    f"年化标准差异常大: {annual_std:.2%}, "
-                    f"交易频率={trades_per_year:.1f}次/年, "
-                    f"单笔波动={std_return:.2%}"
-                )
-                # 不强制调整，仅警告
-        else:
-            annual_return = 0.0
-            annual_std = 1.0
-
-        # 🛡️ 最终异常值检测（双重保护）
-        if annual_std == 0 or np.isnan(annual_std) or np.isinf(annual_std):
-            logger.warning(f"年化标准差最终检查失败: {annual_std}")
-            return 0.0
-
-        if np.isnan(annual_return) or np.isinf(annual_return):
-            logger.warning(f"年化收益率最终检查失败: {annual_return}")
-            return 0.0
-
-        # 夏普比率 = (年化收益率 - 无风险利率) / 年化标准差
-        sharpe = (annual_return - cls.get_risk_free_rate()) / annual_std
-
-        # 异常值处理
-        if np.isnan(sharpe) or np.isinf(sharpe):
-            logger.warning("Sharpe 比率计算结果为 NaN 或 Inf")
-            return 0.0
-
-        # 🎯 强化上限检查（Sharpe > 10 极为罕见）
-        MAX_REASONABLE_SHARPE = 10.0  # 正常范围：-3 到 +10
-
-        if abs(sharpe) > MAX_REASONABLE_SHARPE:
-            logger.warning(
-                f"⚠️  Sharpe 比率异常: {sharpe:.4f} (超出合理范围 ±{MAX_REASONABLE_SHARPE})\n"
-                f"   年化收益率: {annual_return:.2%}\n"
-                f"   年化标准差: {annual_std:.2%}\n"
-                f"   交易笔数: {trading_days}\n"
-                f"   时间跨度: {time_span_days:.1f} 天\n"
-                f"   单笔收益率标准差: {std_return:.4f}\n"
-                f"   建议：检查数据质量或使用固定本金算法"
-            )
-
-            # 强制限制在合理范围内
-            sharpe = np.sign(sharpe) * MAX_REASONABLE_SHARPE
-
-        # 数据库边界保护：DECIMAL(10, 4) 最大值为 999,999.9999
-        sharpe = max(-999999.9999, min(999999.9999, sharpe))
-
-        return float(sharpe)
-
-    @classmethod
-    def calculate_sharpe_ratio_enhanced(
-        cls,
-        fills: List[Dict],
-        account_value: float,
-        actual_initial_capital: Optional[float] = None,
-        ledger: Optional[List[Dict]] = None,
-        address: Optional[str] = None,
-        state: Optional[Dict] = None,
-        # 性能优化：预计算数据参数
-        precalculated_events: Optional[List[Dict]] = None,
-        precalculated_realized_pnl: Optional[float] = None,
-        precalculated_sorted_fills: Optional[List[Dict]] = None
-    ) -> tuple[float, Dict]:
-        """
-        改进版Sharpe比率计算（P2优化：集成出入金和资金费率）
-
-        优化点：
-        1. 集成ledger数据，正确处理出入金对资金基准的影响
-        2. 整合资金费率数据，计入总收益
-        3. 基于动态资金基准计算收益率序列
-        4. P1性能优化：支持预计算数据，避免重复遍历
-
-        Args:
-            fills: 交易记录列表
-            account_value: 当前账户价值
-            actual_initial_capital: 实际初始资金
-            ledger: 出入金记录（可选）
-            address: 钱包地址（可选）
-            state: 用户状态数据（包含资金费率，可选）
-            precalculated_events: 预计算的事件列表（性能优化）
-            precalculated_realized_pnl: 预计算的已实现PNL（性能优化）
-            precalculated_sorted_fills: 预排序的fills列表（性能优化）
-
-        Returns:
-            (sharpe_ratio, details)
-
-        Details包含：
-            - quality: 质量标记
-            - funding_pnl: 资金费率盈亏
-            - funding_contribution: 资金费率贡献百分比
-        """
-        # 如果没有ledger和state，降级到旧算法
-        if not ledger and not state:
-            sharpe_old = cls.calculate_sharpe_ratio(fills, account_value, actual_initial_capital)
-            return sharpe_old, {'quality': 'estimated_fallback', 'funding_pnl': 0.0, 'funding_contribution': 0.0}
-
-        if not fills or len(fills) < 2:
-            return 0.0, {'quality': 'insufficient_data', 'funding_pnl': 0.0, 'funding_contribution': 0.0}
-
-        # 1. 获取资金费率盈亏
-        funding_pnl = 0.0
-        if state:
-            for asset in state.get('assetPositions', []):
-                pos = asset.get('position', {})
-                cum_funding = pos.get('cumFunding', {})
-                # 使用allTime累计总资金费（负数=收益，正数=成本）
-                all_time_funding = cum_funding.get('allTime', '0')
-                # 资金费率：负数表示收到，正数表示支付
-                # 为了统一，我们将"收到"作为正收益
-                funding_pnl -= float(all_time_funding)
-
-        # 2. P1优化：使用预计算的events（如果提供）
-        if precalculated_events is not None:
-            events = precalculated_events
-        else:
-            # 原有逻辑：合并交易和出入金事件
-            events = []
-
-            # 添加交易事件
-            for fill in fills:
-                events.append({
-                    'time': fill.get('time', 0),
-                    'type': 'trade',
-                    'pnl': MetricsEngine._get_pnl(fill)
-                })
-
-            # 添加出入金事件
-            if ledger and address:
-                for record in ledger:
-                    amount = cls._extract_ledger_amount(record, address)
-                    if amount != 0:
-                        events.append({
-                            'time': record.get('time', 0),
-                            'type': 'cash_flow',
-                            'amount': amount
-                        })
-
-            # 按时间排序
-            events.sort(key=lambda x: x['time'])
-
-        # 3. P1优化：使用预计算的 realized_pnl
-        if precalculated_realized_pnl is not None:
-            trading_pnl_for_initial = precalculated_realized_pnl
-        else:
-            trading_pnl_for_initial = sum(e['pnl'] for e in events if e['type'] == 'trade')
-
-        # 4. 确定初始资金
-        if actual_initial_capital is not None and actual_initial_capital > 0:
-            initial_capital = actual_initial_capital
-            quality = 'enhanced'
-        else:
-            # 推算初始资金：当前价值 - 已实现盈亏 - 资金费
-            initial_capital = account_value - trading_pnl_for_initial - funding_pnl
-
-            if initial_capital <= 0:
-                initial_capital = max(account_value, 1000)
-                quality = 'estimated'
-            else:
-                quality = 'standard'
-
-        # 边界保护
-        if initial_capital <= 0:
-            initial_capital = max(account_value, 1000)
-
-        # 5. 构建收益率序列（考虑出入金）
-        returns = []
-        running_capital = initial_capital
-        bankruptcy_detected = False
-
-        for event in events:
-            if event['type'] == 'cash_flow':
-                # 出入金事件：调整资金基准，不计入收益率
-                running_capital += event['amount']
-
-            elif event['type'] == 'trade':
-                # 交易事件：基于当前资金计算收益率
-                if running_capital > 0 and not bankruptcy_detected:
-                    pnl = event['pnl']
-                    ret = pnl / running_capital
-                    returns.append(ret)
-                    running_capital += pnl
-
-                    # 爆仓检测
-                    if running_capital <= 0:
-                        logger.warning(
-                            f"检测到爆仓: 资金 {running_capital - pnl:.2f} → {running_capital:.2f}"
-                        )
-                        bankruptcy_detected = True
-                        break
-
-        if not returns or len(returns) < 2:
-            return 0.0, {'quality': quality, 'funding_pnl': funding_pnl, 'funding_contribution': 0.0}
-
-        # 6. 将资金费率加入总收益（在计算年化收益时考虑）
-        # 资金费率视为额外收益，分摊到整个交易周期
-        # P1优化：复用已计算的 trading_pnl
-        total_trading_pnl = trading_pnl_for_initial
-        total_pnl_with_funding = total_trading_pnl + funding_pnl
-
-        # 计算资金费率贡献百分比
-        if total_trading_pnl != 0:
-            funding_contribution = (funding_pnl / abs(total_trading_pnl)) * 100
-        else:
-            funding_contribution = 0.0
-
-        # 7. 计算年化收益率和波动率
-        returns_array = np.array(returns)
-        mean_return = np.mean(returns_array)
-        std_return = np.std(returns_array, ddof=1)
-
-        if std_return == 0:
-            return 0.0, {'quality': quality, 'funding_pnl': funding_pnl, 'funding_contribution': funding_contribution}
-
-        # 计算时间跨度
-        # P1优化：使用预计算的 sorted_fills
-        if precalculated_sorted_fills is not None:
-            sorted_fills = precalculated_sorted_fills
-        else:
-            sorted_fills = cls._ensure_sorted_fills(fills)
-        first_time = sorted_fills[0]['time']
-        last_time = sorted_fills[-1]['time']
-
-        if isinstance(first_time, datetime) and isinstance(last_time, datetime):
-            time_span_days = (last_time - first_time).total_seconds() / 86400
-        else:
-            time_span_days = (last_time - first_time) / (1000 * 86400)
-
-        if time_span_days <= 0:
-            time_span_days = 1
-
-        # 年化计算（包含资金费率影响）
-        trading_days = len(returns)
-        if trading_days > 0 and time_span_days > 0:
-            years = time_span_days / MetricsEngine.ANNUAL_DAYS
-
-            if years > 0:
-                # 使用包含资金费的总收益计算年化
-                total_return_with_funding = total_pnl_with_funding / initial_capital
-
-                # 🛡️ 防止指数运算溢出
-                # 当交易天数太短时，直接使用简单年化而非复利
-                MIN_YEARS_FOR_COMPOUND = 0.08  # 至少30天（30/365≈0.08）
-
-                if years < MIN_YEARS_FOR_COMPOUND:
-                    # 简单年化：收益率 × (365 / 天数)
-                    annual_return = total_return_with_funding * (1 / years)
-                    logger.debug(
-                        f"[Enhanced] 使用简单年化（交易期间太短: {years*365:.0f}天）, "
-                        f"收益率={annual_return:.2%}"
-                    )
-                else:
-                    # 复利年化：(1 + 总收益) ^ (1/年数) - 1
-                    try:
-                        # 限制总收益率范围：[-0.99, 100]（防止溢出）
-                        total_return_capped = max(-0.99, min(total_return_with_funding, 100))
-
-                        annual_return = (1 + total_return_capped) ** (1 / years) - 1
-
-                        # 检查是否溢出
-                        if np.isnan(annual_return) or np.isinf(annual_return) or abs(annual_return) > 100:
-                            # 溢出，使用简单年化
-                            annual_return = total_return_with_funding * (1 / years)
-                            logger.warning(
-                                f"[Enhanced] 复利年化溢出，降级为简单年化: {annual_return:.2%}"
-                            )
-                    except (OverflowError, ValueError) as e:
-                        # 指数运算溢出，使用简单年化
-                        annual_return = total_return_with_funding * (1 / years)
-                        logger.warning(
-                            f"[Enhanced] 年化计算异常: {e}, 降级为简单年化"
-                        )
-
-                # 最终上限保护：年化收益率不应超过 ±10000%
-                MAX_ANNUAL_RETURN = 100.0  # ±10000%
-                if abs(annual_return) > MAX_ANNUAL_RETURN:
-                    logger.warning(
-                        f"[Enhanced] 年化收益率过大: {annual_return:.2%}, "
-                        f"限制为 ±{MAX_ANNUAL_RETURN*100:.0f}%"
-                    )
-                    annual_return = np.sign(annual_return) * MAX_ANNUAL_RETURN
-            else:
-                annual_return = 0.0
-
-            # 🔧 修复：年化标准差（使用更稳健的方法）
-            # 计算平均每笔交易的时间间隔（天）
-            avg_days_per_trade = time_span_days / max(trading_days - 1, 1)
-
-            # 方法：基于交易频率的年化标准差
-            # 假设：年化波动 = 单笔交易波动 × sqrt(年交易次数)
-            trades_per_year = MetricsEngine.ANNUAL_DAYS / avg_days_per_trade
-            annual_std = std_return * np.sqrt(trades_per_year)
-
-            # 🛡️ 强化异常值保护
-            # 1. 最小年化标准差保护（防止 Sharpe 虚高）
-            MIN_ANNUAL_STD = 0.01  # 最小年化标准差 1%
-            if annual_std < MIN_ANNUAL_STD:
-                logger.warning(
-                    f"[Enhanced] 年化标准差过小: {annual_std:.6f}, "
-                    f"调整为最小值 {MIN_ANNUAL_STD:.2%}"
-                )
-                annual_std = MIN_ANNUAL_STD
-
-            # 2. NaN/Inf 检查
-            if np.isnan(annual_return) or np.isinf(annual_return):
-                logger.warning(f"[Enhanced] 年化收益率异常: {annual_return}")
-                annual_return = 0.0
-            if np.isnan(annual_std) or np.isinf(annual_std):
-                logger.warning(f"[Enhanced] 年化标准差异常: {annual_std}")
-                annual_std = 1.0
-
-            # 3. 合理性检查（应在 1%-500% 范围内）
-            if annual_std > 5.0:  # >500%
-                logger.warning(
-                    f"[Enhanced] 年化标准差异常大: {annual_std:.2%}, "
-                    f"交易频率={trades_per_year:.1f}次/年, "
-                    f"单笔波动={std_return:.2%}"
-                )
-        else:
-            annual_return = 0.0
-            annual_std = 1.0
-
-        # 计算Sharpe比率
-        if annual_std == 0 or np.isnan(annual_std) or np.isinf(annual_std):
-            logger.warning("[Enhanced] 最终年化标准差检查失败")
-            sharpe = 0.0
-        else:
-            sharpe = (annual_return - cls.get_risk_free_rate()) / annual_std
-
-        # 异常值处理
-        if np.isnan(sharpe) or np.isinf(sharpe):
-            logger.warning("[Enhanced] Sharpe 比率计算结果为 NaN 或 Inf")
-            sharpe = 0.0
-
-        # 🎯 强化上限检查（Sharpe > 10 极为罕见）
-        MAX_REASONABLE_SHARPE = 10.0
-
-        if abs(sharpe) > MAX_REASONABLE_SHARPE:
-            logger.warning(
-                f"⚠️  [Enhanced] Sharpe 比率异常: {sharpe:.4f} (超出合理范围 ±{MAX_REASONABLE_SHARPE})\n"
-                f"   年化收益率: {annual_return:.2%}\n"
-                f"   年化标准差: {annual_std:.2%}\n"
-                f"   交易笔数: {trading_days}\n"
-                f"   时间跨度: {time_span_days:.1f} 天\n"
-                f"   单笔收益率标准差: {std_return:.4f}\n"
-                f"   资金费率贡献: ${funding_pnl:.2f} ({funding_contribution:.1f}%)\n"
-                f"   建议：检查数据质量或使用固定本金算法"
-            )
-
-            # 强制限制在合理范围内
-            sharpe = np.sign(sharpe) * MAX_REASONABLE_SHARPE
-
-        # 边界保护
-        sharpe = max(-999999.9999, min(999999.9999, sharpe))
-
-        details = {
-            'quality': quality,
-            'funding_pnl': funding_pnl,
-            'funding_contribution': funding_contribution,
-            'annual_return': annual_return,
-            'annual_std': annual_std
-        }
-
-        return float(sharpe), details
 
     @staticmethod
     def _extract_ledger_amount(record: Dict, target_address: str) -> float:
@@ -2074,9 +1504,7 @@ class MetricsEngine:
                 total_trades=0,
                 win_rate=0.0,
                 roi=0.0,
-                sharpe_ratio=0.0,
                 total_pnl=0.0,
-                account_value=0.0,
                 max_drawdown=0.0,
                 avg_trade_size=0.0,
                 total_volume=0.0,
@@ -2108,7 +1536,7 @@ class MetricsEngine:
         # 计算总账户价值
         account_value = perp_value_temp + spot_value_temp
 
-        logger.info(f"账户价值: ${account_value:,.2f}")
+        logger.debug(f"内部计算用账户价值: ${account_value:,.2f}")
 
         # 提取出入金数据
         has_transfer_data = transfer_data is not None
@@ -2283,15 +1711,6 @@ class MetricsEngine:
 
         # ========== P1性能优化：传递预计算数据给各指标计算方法 ==========
 
-        # 使用真实初始资金计算夏普比率（P2优化：集成出入金和资金费率）
-        # P1优化：传递预计算的 events, realized_pnl, sorted_fills
-        sharpe_ratio, sharpe_details = cls.calculate_sharpe_ratio_enhanced(
-            fills, account_value, actual_initial, ledger_data, address, state,
-            precalculated_events=events,
-            precalculated_realized_pnl=realized_pnl,
-            precalculated_sorted_fills=sorted_fills
-        )
-
         # 计算最大回撤（使用改进算法，如果有ledger数据）
         # P1优化：传递预计算的 events, realized_pnl, sorted_fills
         max_drawdown, dd_details = cls.calculate_max_drawdown(
@@ -2332,9 +1751,7 @@ class MetricsEngine:
             address=address,
             total_trades=len(fills),
             win_rate=win_rate,
-            sharpe_ratio=sharpe_ratio,
             total_pnl=total_pnl,
-            account_value=account_value,
             max_drawdown=max_drawdown,
             avg_trade_size=avg_trade_size,
             total_volume=total_volume,
@@ -2353,7 +1770,6 @@ class MetricsEngine:
             true_capital_roi=true_capital_roi,
             # P0 修复字段
             bankruptcy_count=bankruptcy_count,
-            sharpe_method="compound_interest",
             # 回撤详细信息（P0优化）
             max_drawdown_legacy=dd_details.get('max_drawdown_legacy', max_drawdown),
             drawdown_quality=dd_details.get('quality', 'estimated'),
@@ -2369,10 +1785,6 @@ class MetricsEngine:
             roi_quality=roi_quality,
             # 累计收益率指标（新增）
             initial_capital_corrected=initial_capital_corrected,
-            # Sharpe比率扩展指标（P2优化）
-            sharpe_quality=sharpe_details.get('quality', 'estimated'),
-            funding_pnl=sharpe_details.get('funding_pnl', 0.0),
-            funding_contribution=sharpe_details.get('funding_contribution', 0.0),
             # 回撤期间分析（P2优化）
             drawdown_periods_count=dd_periods_analysis['total_periods'],
             avg_drawdown_duration_days=dd_periods_analysis['avg_duration_days'],

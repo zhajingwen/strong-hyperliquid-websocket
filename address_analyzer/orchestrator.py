@@ -4,7 +4,8 @@
 
 import asyncio
 import logging
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Set
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 
 from .log_parser import LogParser
@@ -47,6 +48,24 @@ class Orchestrator:
 
         self.max_concurrent = max_concurrent
         self.rate_limit = rate_limit
+
+        # 黑名单
+        self.blacklist: Set[str] = set()
+        self._load_blacklist()
+
+    def _load_blacklist(self):
+        """从 blacklist.txt 加载黑名单地址"""
+        blacklist_path = Path(__file__).parent / "blacklist.txt"
+        if not blacklist_path.exists():
+            logger.info("未找到黑名单文件，跳过黑名单过滤")
+            return
+        with open(blacklist_path, "r") as f:
+            for line in f:
+                addr = line.strip().lower()
+                if addr:
+                    self.blacklist.add(addr)
+        if self.blacklist:
+            logger.info(f"已加载黑名单: {len(self.blacklist)} 个地址")
 
     async def initialize(self):
         """初始化数据库和API客户端"""
@@ -98,9 +117,24 @@ class Orchestrator:
             self.renderer.console.print("\n[bold cyan]步骤 1/5:[/bold cyan] 解析交易日志...")
             logger.info(f"步骤 1/5: 开始解析交易日志文件: {self.log_path}")
             address_stats = self.log_parser.parse()
+            total_parsed = len(address_stats)
+            logger.info(f"步骤 1/5: 解析到 {total_parsed} 个唯一地址")
+
+            # 过滤黑名单地址
+            if self.blacklist:
+                before_count = len(address_stats)
+                address_stats = {
+                    addr: stats for addr, stats in address_stats.items()
+                    if addr.lower() not in self.blacklist
+                }
+                blacklisted_count = before_count - len(address_stats)
+                if blacklisted_count > 0:
+                    logger.info(f"已过滤黑名单地址: {blacklisted_count} 个")
+                    self.renderer.console.print(f"🚫 已过滤黑名单地址 [bold]{blacklisted_count}[/bold] 个\n")
+
             addresses = list(address_stats.keys())
-            logger.info(f"步骤 1/5 完成: 解析到 {len(addresses)} 个唯一地址")
-            self.renderer.console.print(f"✅ 解析到 [bold]{len(addresses)}[/bold] 个唯一地址\n")
+            logger.info(f"步骤 1/5 完成: 最终 {len(addresses)} 个有效地址")
+            self.renderer.console.print(f"✅ 解析到 [bold]{total_parsed}[/bold] 个唯一地址，有效 [bold]{len(addresses)}[/bold] 个\n")
 
             # 2. 更新地址表
             self.renderer.console.print("[bold cyan]步骤 2/5:[/bold cyan] 更新地址数据库...")
@@ -222,6 +256,7 @@ class Orchestrator:
             calculated_count = 0
             qualified_count = 0
             skipped_no_fills = 0
+            skipped_few_fills = 0
             skipped_filters = 0
             skipped_liquidation = 0
 
@@ -240,6 +275,11 @@ class Orchestrator:
                 if not fills:
                     skipped_no_fills += 1
                     logger.warning(f"[{idx}/{len(addresses)}] 地址无交易记录: {addr[:10]}... (跳过)")
+                    continue
+
+                if len(fills) < 10:
+                    skipped_few_fills += 1
+                    logger.warning(f"[{idx}/{len(addresses)}] 地址 {addr[:10]}... 历史订单仅 {len(fills)} 笔（<10），跳过分析")
                     continue
 
                 # 获取账户状态（从数据库）
@@ -264,9 +304,7 @@ class Orchestrator:
                 await self.store.save_metrics(addr, {
                     'total_trades': metrics.total_trades,
                     'win_rate': metrics.win_rate,
-                    'sharpe_ratio': metrics.sharpe_ratio,
                     'total_pnl': metrics.total_pnl,
-                    'account_value': metrics.account_value,
                     'max_drawdown': metrics.max_drawdown
                 })
 
@@ -294,6 +332,7 @@ class Orchestrator:
                 f"符合条件 {qualified_count} 个，"
                 f"最近爆仓跳过 {skipped_liquidation} 个，"
                 f"无交易记录 {skipped_no_fills} 个，"
+                f"订单不足10笔跳过 {skipped_few_fills} 个，"
                 f"不符合筛选条件 {skipped_filters} 个"
             )
             self.renderer.console.print(f"✅ 计算完成 [bold]{len(all_metrics)}[/bold] 个地址的指标\n")

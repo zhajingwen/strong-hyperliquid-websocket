@@ -296,9 +296,7 @@ async def test_full_workflow():
         print(f"     - 旧版ROI: {metrics.roi:.2f}%")
         print(f"     - 实际初始资金: ${metrics.actual_initial_capital:,.2f}")
         print(f"     - 校准ROI: {metrics.corrected_roi:.2f}%")
-        print(f"     - 夏普比率: {metrics.sharpe_ratio:.2f}")
         print(f"     - 总PNL: ${metrics.total_pnl:,.2f}")
-        print(f"     - 账户价值: ${metrics.account_value:,.2f}")
         print(f"     - 最大回撤: {metrics.max_drawdown:.2f}%")
 
         # 验证新字段
@@ -328,9 +326,7 @@ async def test_full_workflow():
             'total_trades': metrics.total_trades,
             'win_rate': metrics.win_rate,
             'roi': metrics.roi,
-            'sharpe_ratio': metrics.sharpe_ratio,
             'total_pnl': metrics.total_pnl,
-            'account_value': metrics.account_value,
             'max_drawdown': metrics.max_drawdown,
             'net_deposit': metrics.net_deposits
         })

@@ -133,9 +133,7 @@ class OutputRenderer:
         table.add_column("地址", style="cyan", width=44, no_wrap=False)
         table.add_column("交易数", justify="right", width=8)
         table.add_column("胜率", justify="right", width=8)
-        table.add_column("夏普", justify="right", width=8)
         table.add_column("总PNL", justify="right", width=12)
-        table.add_column("账户价值", justify="right", width=12)
         table.add_column("最大回撤", justify="right", width=10)
 
         # 添加行
@@ -148,9 +146,7 @@ class OutputRenderer:
                 metrics.address,
                 str(metrics.total_trades),
                 f"{metrics.win_rate:.1f}%",
-                f"{metrics.sharpe_ratio:.2f}",
                 f"[{pnl_color}]${metrics.total_pnl:,.0f}[/{pnl_color}]",
-                f"${metrics.account_value:,.0f}",
                 f"{metrics.max_drawdown:.1f}%"
             )
 
@@ -243,9 +239,7 @@ class OutputRenderer:
                     <th>地址</th>
                     <th>交易数</th>
                     <th>胜率</th>
-                    <th>夏普比率</th>
                     <th>总PNL</th>
-                    <th>账户价值</th>
                     <th>最大回撤</th>
                 </tr>
             </thead>
@@ -256,11 +250,9 @@ class OutputRenderer:
                     <td class="address">{{ m.address }}</td>
                     <td>{{ m.total_trades }}</td>
                     <td>{{ m.win_rate|round(1) }}%</td>
-                    <td>{{ m.sharpe_ratio|round(2) }}</td>
                     <td class="{% if m.total_pnl > 0 %}positive{% else %}negative{% endif %}">
                         ${{ "{:,.0f}".format(m.total_pnl) }}
                     </td>
-                    <td>${{ "{:,.0f}".format(m.account_value) }}</td>
                     <td>{{ m.max_drawdown|round(1) }}%</td>
                 </tr>
                 {% endfor %}
